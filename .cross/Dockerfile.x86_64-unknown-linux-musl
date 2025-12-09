@@ -1,0 +1,25 @@
+FROM messense/rust-musl-cross:x86_64-musl
+
+# Install protobuf compiler and linux headers for musl OpenSSL build
+RUN apt-get update && \
+    apt-get install -y protobuf-compiler linux-headers-generic && \
+    rm -rf /var/lib/apt/lists/*
+
+# Download and build OpenSSL for musl target
+# Use the full compiler name: x86_64-unknown-linux-musl-gcc
+RUN cd /tmp && \
+    curl -LO https://www.openssl.org/source/openssl-1.1.1w.tar.gz && \
+    tar xzf openssl-1.1.1w.tar.gz && \
+    cd openssl-1.1.1w && \
+    CC=/usr/local/musl/bin/x86_64-unknown-linux-musl-gcc ./Configure no-shared no-async -DOPENSSL_NO_SECURE_MEMORY linux-x86_64 \
+    --prefix=/usr/local/musl/x86_64-unknown-linux-musl \
+    --openssldir=/usr/local/musl/x86_64-unknown-linux-musl/ssl && \
+    make -j$(nproc) && \
+    make install_sw && \
+    cd / && rm -rf /tmp/openssl*
+
+# Set OpenSSL environment variables for musl cross-compilation
+ENV OPENSSL_DIR=/usr/local/musl/x86_64-unknown-linux-musl \
+    OPENSSL_STATIC=1 \
+    OPENSSL_INCLUDE_DIR=/usr/local/musl/x86_64-unknown-linux-musl/include \
+    OPENSSL_LIB_DIR=/usr/local/musl/x86_64-unknown-linux-musl/lib

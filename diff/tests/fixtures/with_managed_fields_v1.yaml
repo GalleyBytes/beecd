@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-with-managed-fields
+  namespace: default
+  managedFields:
+    - manager: kubectl-client-side-apply
+      operation: Update
+      apiVersion: apps/v1
+      time: "2024-01-15T10:30:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:labels:
+            f:app: {}
+            f:version: {}
+        f:spec:
+          f:replicas: {}
+          f:selector: {}
+          f:template:
+            f:metadata:
+              f:labels:
+                f:app: {}
+            f:spec:
+              f:containers:
+                k:{"name":"app"}:
+                  .: {}
+                  f:image: {}
+                  f:name: {}
+                  f:ports:
+                    k:{"containerPort":8080,"protocol":"TCP"}:
+                      .: {}
+                      f:containerPort: {}
+                  f:resources:
+                    f:requests:
+                      f:cpu: {}
+                      f:memory: {}
+    - manager: kube-controller-manager
+      operation: Update
+      apiVersion: apps/v1
+      time: "2024-01-15T10:31:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:status:
+          f:availableReplicas: {}
+          f:readyReplicas: {}
+          f:replicas: {}
+          f:updatedReplicas: {}
+          f:conditions: {}
+    - manager: karpenter
+      operation: Update
+      apiVersion: apps/v1
+      time: "2024-01-15T10:32:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:annotations:
+            f:karpenter.sh/nodepool: {}
+  labels:
+    app: myapp
+    version: v1.0.0
+  annotations:
+    karpenter.sh/nodepool: "default"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: app
+          image: myapp:v1.0.0
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+status:
+  availableReplicas: 3
+  readyReplicas: 3
+  replicas: 3
+  updatedReplicas: 3
+  conditions:
+    - type: Available
+      status: "True"
+      lastUpdateTime: "2024-01-15T10:31:00Z"
+      lastTransitionTime: "2024-01-15T10:31:00Z"
+      reason: MinimumReplicasAvailable
+      message: Deployment has minimum availability.

@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package beecd;
+
+// The service definition.
+service Worker {
+  // Client sends registration as a name string and receives an OK
+  rpc ClientRegistration (ClusterName) returns (ClusterId) {}
+
+  // Client sends resource-registration as a list of strings and receives an OK
+  rpc ClientNamespaceRegistration (ClientNamespaceRegistrationRequest) returns (ClientNamespaceRegistrationResponse) {}
+
+  // Client makes a call and receives a list of strings (known as list of DocumentIds)
+  rpc GetRelease (GetReleaseRequest) returns (GetReleaseResponse) {}
+
+  // Client sends the Release description and receives and zip file or whatever rpc allows as an equivalent to a binary file
+  rpc GetServiceManifest (GetServiceManifestRequest) returns (Manifest) {}
+
+  // Client sends the Release description and a status (ie diff) and receives OK
+  rpc ServiceStatus (ServiceStatusRequest) returns (Empty) {}
+
+  rpc RestoreDiff (RestoreDiffRequest) returns (RestoreDiffResponse) {}
+
+  rpc InstallationStatus (InstallationStatusRequest) returns (Empty) {}
+
+  // Client makes a request to find service description
+  rpc GetApprovedReleases (ClusterId) returns (GetApprovedReleasesResponse) {}
+
+  // Client received an error and sends it back in with context for logging
+  rpc LogReleaseError (LogReleaseErrorRequest) returns (Empty) {}
+
+  // Client received a cluster_level error and sends it back in with context for logging
+  rpc LogHiveError (LogHiveErrorRequest) returns (Empty) {}
+
+  // Authentication RPCs (no interceptor auth required)
+  rpc Login (LoginRequest) returns (LoginResponse) {}
+  rpc RefreshToken (RefreshTokenRequest) returns (RefreshTokenResponse) {}
+  rpc Logout (LogoutRequest) returns (Empty) {}
+}
+
+// The message types.
+message ClusterName {
+  string cluster_name = 1;
+  string metadata = 2;
+  string version = 3;
+  string kubernetes_version = 4;
+}
+
+message ClusterId {
+  string cluster_id = 1;
+}
+
+message ClientNamespaceRegistrationRequest {
+  string cluster_id = 1;
+  repeated string namespace = 2;
+}
+
+message GetReleaseRequest {
+  string cluster_id = 1;
+  repeated string namespace_id = 2;
+}
+
+message GetReleaseResponse {
+  repeated Release release  = 1;
+
+}
+
+message Release {
+  string id = 1;
+  string service_id = 2;
+  string repo_branch_id = 3;
+  string hash = 4;
+  string path = 5;
+  string name = 6;
+  string version = 7;
+  string namespace_id = 8;
+  string git_sha = 9;
+  int32 diff_generation = 10;
+  string branch = 11;
+  string org = 12;
+  string repo = 13;
+  bool completed_first_install  = 14;
+  string previous_installed_hash = 15;
+  string namespace_name = 16;
+  bool marked_for_deletion = 17;
+}
+
+message ClientNamespaceRegistrationResponse {
+  repeated NamespaceMap namespace_data  = 1;
+}
+
+message NamespaceMap {
+  string name = 1;
+  string id = 2;
+}
+
+message GetServiceManifestRequest {
+  string release_id = 1;
+}
+
+message Manifest {
+  bytes data = 1;
+}
+
+message Diff {
+  string key = 1;
+  bytes body = 2;
+  repeated string change_order = 3;
+}
+
+message ServiceStatusRequest {
+  string release_id = 1;
+  repeated Diff diff = 2;
+  bool is_diff = 3;
+  bool is_next_generation_diff = 4;
+  string previous_installed_hash = 5;
+  int32 diff_generation = 6;
+  bool post_success = 7;
+  string in_cluster_manifest = 8;
+}
+
+message RestoreDiffRequest {
+  string release_id = 1;
+}
+
+message RestoreDiffResponse {
+  repeated Diff diff = 1;
+}
+
+message InstallationStatusRequest {
+  string release_id = 1;
+  string msg = 2;
+  bool started = 3;
+  bool failed = 4;
+  bool completed = 5;
+}
+
+message GetApprovedReleasesResponse {
+  repeated string release_id = 1;
+}
+
+message LogReleaseErrorRequest {
+  string release_id = 1;
+  bytes message = 2;
+  bool is_deprecated = 3;
+}
+
+message LogHiveErrorRequest {
+  string cluster_id = 1;
+  bytes message = 2;
+  bool is_deprecated = 3;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+  string user_agent = 3;
+}
+
+message LoginResponse {
+  string access_token = 1;   // JWT, 15 min expiry
+  string refresh_token = 2;  // Opaque UUID, 24 hour expiry
+  int64 access_token_expires_in = 3;  // Seconds until access token expires
+  int64 refresh_token_expires_in = 4; // Seconds until refresh token expires
+  string token_type = 5;  // "Bearer"
+}
+
+message RefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+message RefreshTokenResponse {
+  string access_token = 1;
+  string refresh_token = 2;  // New refresh token (rotation)
+  int64 access_token_expires_in = 3;
+  int64 refresh_token_expires_in = 4;
+  string token_type = 5;
+}
+
+message LogoutRequest {
+  string refresh_token = 1;  // Optional: if provided, revoke it
+}
+
+message Empty {}

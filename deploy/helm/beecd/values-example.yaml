@@ -1,0 +1,127 @@
+# Example values for BeeCD production deployment
+# This example uses embedded PostgreSQL and MinIO for a complete standalone installation.
+# For production with external databases, set postgresql.enabled=false and configure external endpoints.
+#
+# Quick start:
+#   1. Create Kubernetes secrets:
+#      kubectl create secret generic github-tokens --from-literal=GHUSER="user" --from-literal=GHPASS="token"
+#      kubectl create secret generic hive-jwt --from-literal=JWT_SECRET_KEY="$(openssl rand -base64 48)"
+#      kubectl create secret generic sops-gpg --from-literal=FINGER_PRINT="..." --from-literal=GPG_KEY="..."
+#   
+#   2. Copy and customize this file:
+#      cp values-example.yaml my-values.yaml
+#   
+#   3. Install:
+#      helm dependency update ./deploy/helm/beecd
+#      helm install beecd ./deploy/helm/beecd -f my-values.yaml -n beecd --create-namespace
+
+# Image registry (change to your registry)
+image:
+  registry: ghcr.io/yourorg
+  tag: "0.1.0"
+
+
+
+# Enable embedded PostgreSQL (auto-creates hive database)
+postgresql:
+  enabled: true
+  auth:
+    username: postgres
+    password: beecd-postgres
+    database: postgres
+  primary:
+    persistence:
+      size: 10Gi
+
+# Enable embedded MinIO (auto-creates beecd-diffs bucket)
+minio:
+  enabled: true
+  mode: standalone
+  replicas: 1
+  resources:
+    requests:
+      memory: 1Gi
+  persistence:
+    size: 10Gi
+  rootUser: minioadmin
+  rootPassword: minioadmin
+
+hiveServer:
+  # Database configuration (auto-configured when postgresql.enabled=true)
+  database:
+    hive:
+      # host is auto-configured to use embedded PostgreSQL
+      # For external database, set host explicitly and set postgresql.enabled=false
+      user: hive_user
+      # Use existingSecret to reference Kubernetes secret:
+      # kubectl create secret generic hive-db \
+      #   --from-literal=DATABASE_USER="hive_user" \
+      #   --from-literal=DATABASE_PASSWORD="your-password"
+      # existingSecret: "hive-db"
+  
+  # GitHub credentials - REQUIRED
+  github:
+    # kubectl create secret generic github-tokens \
+    #   --from-literal=GHUSER="your-username" \
+    #   --from-literal=GHPASS="ghp_your_token"
+    existingSecret: "github-tokens"
+    # apiUrl: "https://github.company.com/api/v3"  # For GitHub Enterprise
+  
+  # JWT Authentication - REQUIRED
+  jwt:
+    # kubectl create secret generic hive-jwt \
+    #   --from-literal=JWT_SECRET_KEY="$(openssl rand -base64 48)"
+    existingSecret: "hive-jwt"
+  
+  # SOPS/GPG for encrypted secrets - REQUIRED
+  sops:
+    # Generate GPG key: ./hack/generate-sops-gpg-secret.sh
+    # kubectl create secret generic sops-gpg \
+    #   --from-literal=FINGER_PRINT="YOUR_GPG_FINGERPRINT" \
+    #   --from-literal=GPG_KEY="BASE64_ENCODED_GPG_PRIVATE_KEY"
+    existingSecret: "sops-gpg"
+  
+  # Storage backend (auto-configured when minio.enabled=true)
+  storage:
+    # Using embedded MinIO by default
+    s3:
+      enabled: false
+    
+    minio:
+      enabled: true
+      # endpoint is auto-configured to use embedded MinIO
+      # For external S3, set s3.enabled=true and configure S3 settings
+
+hiveHq:
+  # JWT secret
+  # Uses same JWT secret as hiveServer - reference the same existingSecret
+  jwt:
+    existingSecret: "hive-jwt"
+
+  # Defaults for the HiveHQ UI '+ Add Cluster' modal.
+  # These are passed as environment variables to the hive-hq API container.
+  env:
+    # Preferred: explicit GitHub webhook callback URL.
+    # This is the URL GitHub will POST to for webhook events.
+    githubWebhookCallbackUrl: "https://hive-hq.example.com/api/webhooks/github"
+    # Used to pre-fill the Hive gRPC Address field (recommended: host:port, no scheme)
+    hiveDefaultGrpcServer: "hive.example.com:443"
+    # Used to pre-fill the Agent Image field for generated manifests
+    agentDefaultImage: "ghcr.io/yourorg/hive-agent:0.1.0"
+  
+  # Ingress configuration
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: hive-hq.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: hive-hq-tls
+        hosts:
+          - hive-hq.example.com

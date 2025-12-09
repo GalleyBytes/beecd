@@ -1,0 +1,228 @@
+# Default values for beecd
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Image configuration
+image:
+  registry: registry:5000
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion
+  tag: latest
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+
+
+# PostgreSQL subchart configuration
+# Enable to deploy PostgreSQL with the chart
+postgresql:
+  enabled: false
+  auth:
+    username: postgres
+    password: beecd-postgres
+    database: postgres
+  primary:
+    persistence:
+      size: 10Gi
+    initdb:
+      scripts:
+        init.sql: |
+          CREATE DATABASE hive;
+          CREATE USER hive_user WITH PASSWORD 'hive-password';
+          GRANT ALL PRIVILEGES ON DATABASE hive TO hive_user;
+          \c hive
+          CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          GRANT ALL ON SCHEMA public TO hive_user;
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO hive_user;
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO hive_user;
+
+# MinIO subchart configuration
+# Enable to deploy MinIO with the chart
+minio:
+  enabled: false
+  mode: standalone
+  replicas: 1
+  resources:
+    requests:
+      memory: 512Mi
+  persistence:
+    size: 10Gi
+  rootUser: minioadmin
+  rootPassword: minioadmin
+  buckets:
+    - name: beecd-diffs
+      policy: none
+      purge: false
+  
+# Hive Server configuration
+hiveServer:
+  enabled: true
+  replicaCount: 1
+  
+  image:
+    repository: hive-server
+    tag: ""  # Optional: override image tag for this component
+    
+  service:
+    type: ClusterIP
+    port: 5180
+    
+  resources: {}
+    # limits:
+    #   cpu: 500m
+    #   memory: 512Mi
+    # requests:
+    #   cpu: 250m
+    #   memory: 256Mi
+    
+  env:
+    logLevel: info
+    storageType: s3
+    grpcTimeout: 30
+    grpcKeepAlive: 20
+    
+  # Database configuration - REQUIRED (auto-configured if postgresql.enabled=true)
+  database:
+    # Hive database (single database for all BeeCD data)
+    hive:
+      # Leave empty to use embedded PostgreSQL (when postgresql.enabled=true)
+      host: ""  # Will default to {{ .Release.Name }}-postgresql if postgresql.enabled
+      hostRo: ""  # Optional read-only replica, defaults to host if empty
+      port: 5432
+      name: hive
+      user: hive_user
+      password: "hive-password"  # Use existingSecret instead for production
+      existingSecret: ""  # Name of existing secret containing DATABASE_HOST, DATABASE_PASSWORD, etc.
+    
+  # GitHub configuration - REQUIRED
+  github:
+    user: ""
+    token: ""  # Personal Access Token with repo scope
+    apiUrl: ""  # Optional: for GitHub Enterprise
+    existingSecret: ""  # Use existing secret instead
+    
+  # JWT Authentication - REQUIRED for production
+  jwt:
+    # Secret key for JWT signing (minimum 43 characters / 32+ bytes base64-encoded)
+    # Generate with: openssl rand -base64 48 | tr -d '\n'
+    # WARNING: Keep this secret secure - compromise allows token forgery
+    # IMPORTANT: Leave empty and use existingSecret for production
+    secretKey: ""  # Use existingSecret instead for production
+    
+    # Token TTL configuration (optional - defaults shown in seconds)
+    accessTokenTtl: 900      # 15 minutes
+    refreshTokenTtl: 86400   # 24 hours
+    
+    # Use existing Kubernetes secret (RECOMMENDED for production)
+    # Secret must contain: JWT_SECRET_KEY, optionally ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL
+    # To create: kubectl create secret generic hive-jwt-prod \
+    #              --from-literal=JWT_SECRET_KEY="$(openssl rand -base64 48)"
+    existingSecret: ""
+    
+  # SOPS/GPG configuration - REQUIRED for encrypted secrets
+  sops:
+    fingerprint: ""
+    gpgKey: ""  # Base64-encoded GPG private key
+    existingSecret: ""  # Use existing secret instead
+    
+  # Storage configuration (S3 or MinIO) - REQUIRED (auto-configured if minio.enabled=true)
+  storage:
+    # For AWS S3
+    s3:
+      enabled: false  # Set to true for external S3, false when using embedded MinIO
+      bucket: ""
+      region: us-east-1
+      accessKeyId: ""
+      secretAccessKey: ""
+      
+    # For embedded MinIO (auto-configured when minio.enabled=true)
+    minio:
+      enabled: true  # Uses embedded MinIO by default
+      # Endpoint auto-configured to {{ .Release.Name }}-minio:9000 when minio.enabled=true
+      endpoint: ""
+      bucket: beecd-diffs
+      accessKeyId: minioadmin
+      secretAccessKey: minioadmin
+      region: us-east-1
+      
+    existingSecret: ""  # Use existing secret instead
+
+# Hive HQ (Web UI) configuration
+hiveHq:
+  enabled: true
+  replicaCount: 1
+  
+  image:
+    repository: hive-hq
+    tag: ""  # Optional: override image tag for this component
+    
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+    
+  resources: {}
+    
+  env:
+    axumHost: "0.0.0.0"
+    axumPort: 8080
+    dist: dist
+
+    # Preferred: explicit GitHub webhook callback URL.
+    # This is the URL GitHub will POST to for webhook events.
+    # Example:
+    #   https://hive-hq.example.com/api/webhooks/github
+    githubWebhookCallbackUrl: ""
+
+
+    # Defaults used by the HiveHQ UI '+ Add Cluster' modal when creating agent manifests.
+    # These become environment variables on the hive-hq API container.
+    # Both have sensible defaults computed from the chart if left empty.
+    #
+    # hiveDefaultGrpcServer: Defaults to {{ .Release.Name }}-hive-server.{{ .Release.Namespace }}.svc.cluster.local:5180
+    # agentDefaultImage: Defaults to {{ image.registry }}/hive-agent:{{ image.tag }}
+    hiveDefaultGrpcServer: ""
+    agentDefaultImage: ""
+    
+  # JWT configuration
+  jwt:
+    secret: ""  # Auto-generated if not provided
+    existingSecret: ""  # Use existing secret instead
+    
+  # Uses hiveServer.database.hive configuration
+  
+  # Ingress configuration
+  ingress:
+    enabled: false
+    className: nginx
+    annotations: {}
+      # cert-manager.io/cluster-issuer: letsencrypt-prod
+      # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: hive-hq.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+      # - secretName: hive-hq-tls
+      #   hosts:
+      #     - hive-hq.example.com
+
+# Ingress for Hive Server (gRPC)
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+  hosts:
+    - host: hive.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: hive-server-tls
+    #   hosts:
+    #     - hive.example.com

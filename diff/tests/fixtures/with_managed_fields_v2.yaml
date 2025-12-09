@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-with-managed-fields
+  namespace: default
+  managedFields:
+    - manager: kubectl-client-side-apply
+      operation: Update
+      apiVersion: apps/v1
+      time: "2024-01-16T14:00:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:labels:
+            f:app: {}
+            f:version: {}
+        f:spec:
+          f:replicas: {}
+          f:selector: {}
+          f:template:
+            f:metadata:
+              f:labels:
+                f:app: {}
+            f:spec:
+              f:containers:
+                k:{"name":"app"}:
+                  .: {}
+                  f:image: {}
+                  f:name: {}
+                  f:ports:
+                    k:{"containerPort":8080,"protocol":"TCP"}:
+                      .: {}
+                      f:containerPort: {}
+                  f:resources:
+                    f:requests:
+                      f:cpu: {}
+                      f:memory: {}
+                    f:limits:
+                      f:cpu: {}
+                      f:memory: {}
+    - manager: kube-controller-manager
+      operation: Update
+      apiVersion: apps/v1
+      time: "2024-01-16T14:01:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:status:
+          f:availableReplicas: {}
+          f:readyReplicas: {}
+          f:replicas: {}
+          f:updatedReplicas: {}
+          f:conditions: {}
+    - manager: karpenter
+      operation: Update
+      apiVersion: apps/v1
+      time: "2024-01-16T14:02:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:annotations:
+            f:karpenter.sh/nodepool: {}
+  labels:
+    app: myapp
+    version: v2.0.0
+  annotations:
+    karpenter.sh/nodepool: "high-memory"
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: app
+          image: myapp:v2.0.0
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+status:
+  availableReplicas: 5
+  readyReplicas: 5
+  replicas: 5
+  updatedReplicas: 5
+  conditions:
+    - type: Available
+      status: "True"
+      lastUpdateTime: "2024-01-16T14:01:00Z"
+      lastTransitionTime: "2024-01-15T10:31:00Z"
+      reason: MinimumReplicasAvailable
+      message: Deployment has minimum availability.

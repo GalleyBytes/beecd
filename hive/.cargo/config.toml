@@ -1,0 +1,7 @@
+# Cargo configuration for hive package
+
+[env]
+# Set JWT secret for tests - this is automatically available during cargo test
+# Using 56 bytes to test both minimum requirement (32 bytes) and longer secrets
+# Production should use: openssl rand -base64 32
+JWT_SECRET_KEY = "test-secret-key-with-sufficient-length-for-validation"

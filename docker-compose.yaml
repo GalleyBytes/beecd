@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  hivedb:
+    container_name: hivedb # Choose a name for your PostgreSQL container
+    image: postgres:16.4 # Specify the PostgreSQL version
+    restart: always
+    environment:
+      - POSTGRES_USER=pg # Set the PostgreSQL user
+      - POSTGRES_PASSWORD=pass # Set the PostgreSQL password
+      - POSTGRES_DB=crud # Set the PostgreSQL database name
+    ports:
+      - 5432:5432 # Map the PostgreSQL port to your desired host port
+    volumes:
+      - hivedb:/var/lib/postgresql/hivedb_data # Define a volume for persistent data storage
+
+volumes:
+  hivedb:

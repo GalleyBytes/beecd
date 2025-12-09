@@ -1,0 +1,12 @@
+export { HomePage } from './HomePage';
+export { ClustersPage } from './ClustersPage';
+export { ClusterDetailPage } from './ClusterDetailPage';
+export { ReposPage } from './ReposPage';
+export { RepoDetailPage } from './RepoDetailPage';
+export { ServicesPage } from './ServicesPage';
+export { ServiceDetailPage } from './ServiceDetailPage';
+export { ServiceNamePage } from './ServiceNamePage';
+export { ClusterGroupsPage } from './ClusterGroupsPage';
+export { ClusterGroupDetailPage } from './ClusterGroupDetailPage';
+export { ReleaseDetailPage } from './ReleaseDetailPage';
+export { LoginPage } from './LoginPage';

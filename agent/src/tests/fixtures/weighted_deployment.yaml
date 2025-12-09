@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weighted-deployment
+  namespace: default
+  annotations:
+    beecd/weight: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weighted
+  template:
+    metadata:
+      labels:
+        app: weighted
+    spec:
+      containers:
+      - name: app
+        image: app:1.0

@@ -1,0 +1,36 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+kube.workspace = true
+k8s-openapi.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["transport", "channel", "tls"] }
+futures.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+beecdiff.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+flate2.workspace = true
+chrono.workspace = true
+
+
+[build-dependencies]
+tonic-build.workspace = true

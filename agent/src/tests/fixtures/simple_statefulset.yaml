@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-statefulset
+  namespace: default
+spec:
+  serviceName: test-service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: test-stateful
+  template:
+    metadata:
+      labels:
+        app: test-stateful
+    spec:
+      containers:
+      - name: test-container
+        image: postgres:13
+        ports:
+        - containerPort: 5432

@@ -1,0 +1,25 @@
+apiVersion: v2
+name: beecd
+description: A Helm chart for BeeCD - A hard working Continuous Delivery system
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - gitops
+  - continuous-delivery
+  - kubernetes
+  - deployment
+maintainers:
+  - name: BeeCD Team
+sources:
+  - https://github.com/galleybytes/beecd
+
+dependencies:
+  - name: postgresql
+    version: "18.1.14"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: minio
+    version: "5.3.0"
+    repository: https://charts.min.io/
+    condition: minio.enabled

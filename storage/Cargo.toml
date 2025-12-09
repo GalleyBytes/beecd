@@ -1,0 +1,22 @@
+[package]
+name = "beecdstorage"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "beecdstorage"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
+flate2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3.8"
+temp-env = "0.3"
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

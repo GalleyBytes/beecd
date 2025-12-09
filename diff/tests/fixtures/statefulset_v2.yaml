@@ -1,0 +1,223 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: database
+  labels:
+    app: postgresql
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/instance: main
+    app.kubernetes.io/version: "16.1"
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgresql-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+        app.kubernetes.io/name: postgresql
+      annotations:
+        checksum/config: "def456"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+    spec:
+      serviceAccountName: postgresql
+      securityContext:
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: init-chmod-data
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /bitnami/postgresql/data
+              chmod 700 /bitnami/postgresql/data
+              chown 1001:1001 /bitnami/postgresql/data
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+          securityContext:
+            runAsUser: 0
+        - name: init-sysctl
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              sysctl -w vm.max_map_count=262144 || true
+          securityContext:
+            privileged: true
+            runAsUser: 0
+      containers:
+        - name: postgresql
+          image: bitnami/postgresql:16.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: BITNAMI_DEBUG
+              value: "false"
+            - name: POSTGRESQL_PORT_NUMBER
+              value: "5432"
+            - name: POSTGRESQL_VOLUME_DIR
+              value: "/bitnami/postgresql"
+            - name: PGDATA
+              value: "/bitnami/postgresql/data"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secrets
+                  key: postgres-password
+            - name: POSTGRESQL_ENABLE_LDAP
+              value: "no"
+            - name: POSTGRESQL_ENABLE_TLS
+              value: "yes"
+            - name: POSTGRESQL_TLS_CERT_FILE
+              value: "/opt/bitnami/postgresql/certs/tls.crt"
+            - name: POSTGRESQL_TLS_KEY_FILE
+              value: "/opt/bitnami/postgresql/certs/tls.key"
+            - name: POSTGRESQL_LOG_HOSTNAME
+              value: "true"
+            - name: POSTGRESQL_LOG_CONNECTIONS
+              value: "true"
+            - name: POSTGRESQL_LOG_DISCONNECTIONS
+              value: "true"
+            - name: POSTGRESQL_PGAUDIT_LOG
+              value: "all"
+            - name: POSTGRESQL_CLIENT_MIN_MESSAGES
+              value: "notice"
+            - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
+              value: "pg_stat_statements,pgaudit"
+            - name: POSTGRESQL_MAX_CONNECTIONS
+              value: "200"
+          ports:
+            - name: tcp-postgresql
+              containerPort: 5432
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - exec pg_isready -U postgres -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+            successThreshold: 1
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - -e
+                - |
+                  exec pg_isready -U postgres -h 127.0.0.1 -p 5432
+                  [ -f /opt/bitnami/postgresql/tmp/.initialized ]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+            successThreshold: 1
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+            - name: config
+              mountPath: /opt/bitnami/postgresql/conf/conf.d
+            - name: custom-init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+            - name: tls-certs
+              mountPath: /opt/bitnami/postgresql/certs
+              readOnly: true
+        - name: metrics
+          image: bitnami/postgres-exporter:0.15.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATA_SOURCE_URI
+              value: "127.0.0.1:5432/postgres?sslmode=disable"
+            - name: DATA_SOURCE_USER
+              value: postgres
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secrets
+                  key: postgres-password
+            - name: PG_EXPORTER_AUTO_DISCOVER_DATABASES
+              value: "true"
+          ports:
+            - name: http-metrics
+              containerPort: 9187
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+        - name: pgbouncer
+          image: bitnami/pgbouncer:1.21.0
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+          env:
+            - name: POSTGRESQL_HOST
+              value: "127.0.0.1"
+            - name: POSTGRESQL_PORT
+              value: "5432"
+            - name: PGBOUNCER_PORT
+              value: "6432"
+            - name: PGBOUNCER_DATABASE
+              value: "*"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: config
+          configMap:
+            name: postgresql-config
+        - name: custom-init-scripts
+          configMap:
+            name: postgresql-init-scripts
+        - name: tls-certs
+          secret:
+            secretName: postgresql-tls
+            defaultMode: 0400
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: postgresql
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 200Gi

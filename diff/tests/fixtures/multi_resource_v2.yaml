@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+data:
+  database.host: "db-primary.database.svc.cluster.local"
+  database.port: "5432"
+  database.pool.size: "20"
+  database.pool.timeout: "30"
+  redis.host: "redis-cluster.cache.svc.cluster.local"
+  redis.port: "6379"
+  redis.cluster.enabled: "true"
+  log.level: "debug"
+  log.format: "json"
+  feature.flags: |
+    {
+      "newCheckout": true,
+      "darkMode": true,
+      "betaFeatures": true,
+      "experimentalApi": false
+    }
+  rate.limit.requests: "2000"
+  rate.limit.window: "60"
+  rate.limit.burst: "100"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: default
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /var/log/nginx/error.log warn;
+    pid /var/run/nginx.pid;
+    
+    events {
+        worker_connections 2048;
+        use epoll;
+        multi_accept on;
+    }
+    
+    http {
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+        
+        log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+        
+        log_format json_combined escape=json '{"time": "$time_iso8601", '
+                                              '"remote_addr": "$remote_addr", '
+                                              '"request": "$request", '
+                                              '"status": $status}';
+        
+        access_log /var/log/nginx/access.log json_combined;
+        sendfile on;
+        tcp_nopush on;
+        keepalive_timeout 65;
+        gzip on;
+        gzip_types text/plain application/json application/javascript text/css;
+        
+        server {
+            listen 80;
+            server_name localhost;
+            
+            location / {
+                root /usr/share/nginx/html;
+                index index.html index.htm;
+                try_files $uri $uri/ /index.html;
+            }
+            
+            location /api {
+                proxy_pass http://backend:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Request-ID $request_id;
+                proxy_connect_timeout 30s;
+                proxy_read_timeout 60s;
+            }
+            
+            location /health {
+                access_log off;
+                return 200 "OK";
+            }
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: default
+  labels:
+    app: backend
+    tier: backend
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: grpc
+      port: 9000
+      targetPort: 9000
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: default
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+      annotations:
+        prometheus.io/scrape: "true"
+    spec:
+      containers:
+        - name: backend
+          image: backend:v2.0.0
+          ports:
+            - containerPort: 8080
+            - containerPort: 9000
+          envFrom:
+            - configMapRef:
+                name: app-config
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
