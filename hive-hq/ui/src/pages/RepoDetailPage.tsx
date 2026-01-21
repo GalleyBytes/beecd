@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import { ArrowLeft, RefreshCw, ExternalLink, GitBranch, FileCode, Plus, X, Package, Webhook, AlertCircle, CheckCircle, Loader2, Trash2, Clock } from 'lucide-react';
 import { PageHeader, DataTable, Alert } from '@/components';
 import { useRepo, usePaginatedData, useAddRepoBranch, useAddRepoService, useRepoWebhook, useRegisterWebhook, useDeleteWebhook, useWebhookEvents } from '@/hooks';
-import type { RepoBranch, ServiceDefinitionData, GitHubWebhookEvent } from '@/types';
+import type { RepoBranch, ServiceDefinitionData, RepoWebhookEvent } from '@/types';
 
 const GITHUB_URL = 'https://github.com';
 
@@ -348,8 +348,8 @@ export function RepoDetailPage() {
                             </div>
                             <div className="grid grid-cols-2 gap-4 text-sm">
                                 <div>
-                                    <span className="text-gray-500 dark:text-gray-400">GitHub Webhook ID:</span>
-                                    <span className="ml-2 font-mono text-gray-900 dark:text-gray-100">{webhook.github_webhook_id}</span>
+                                    <span className="text-gray-500 dark:text-gray-400">Provider Webhook ID:</span>
+                                    <span className="ml-2 font-mono text-gray-900 dark:text-gray-100">{webhook.provider_webhook_id}</span>
                                 </div>
                                 {webhook.last_delivery_at && (
                                     <div>
@@ -394,7 +394,7 @@ export function RepoDetailPage() {
                                             <p className="text-sm text-gray-500 dark:text-gray-400 py-2">No webhook events yet</p>
                                         ) : (
                                             <div className="max-h-64 overflow-y-auto">
-                                                {webhookEvents.map((event: GitHubWebhookEvent) => (
+                                                {webhookEvents.map((event: RepoWebhookEvent) => (
                                                     <div key={event.id} className="p-2 bg-gray-50 dark:bg-gray-700/50 rounded mb-2 text-sm">
                                                         <div className="flex items-center justify-between">
                                                             <div className="flex items-center gap-2">

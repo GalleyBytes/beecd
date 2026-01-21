@@ -2,8 +2,10 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export enum RepoProvider {
-    GITHUB = 'github',
-    FORGEJO = 'forgejo',
-    GITLAB = 'gitlab',
-}
+export const RepoProvider = {
+    GITHUB: 'github',
+    FORGEJO: 'forgejo',
+    GITLAB: 'gitlab',
+} as const;
+
+export type RepoProvider = typeof RepoProvider[keyof typeof RepoProvider];

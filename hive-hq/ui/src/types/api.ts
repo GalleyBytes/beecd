@@ -207,10 +207,10 @@ export type {
     DeprecateServiceVersion,
     PinServiceVersion,
     // GitHub webhook types
-    GitHubWebhookData,
-    GitHubWebhookEvent,
-    RegisterWebhookRequest,
-    RegisterWebhookResponse,
+    RepoWebhookData,
+    RepoWebhookEvent,
+    RegisterRepoWebhookRequest,
+    RegisterRepoWebhookResponse,
     // Manifest path template types
     PathTemplateValidation,
     UpdateManifestPathTemplate,

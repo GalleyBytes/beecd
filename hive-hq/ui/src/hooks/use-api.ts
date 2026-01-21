@@ -19,10 +19,10 @@ import type {
     ReleaseStatus,
     ServiceVersionForRelease,
     DiffDataWithBody,
-    GitHubWebhookData,
-    RegisterWebhookRequest,
-    RegisterWebhookResponse,
-    GitHubWebhookEvent,
+    RepoWebhookData,
+    RegisterRepoWebhookRequest,
+    RegisterRepoWebhookResponse,
+    RepoWebhookEvent,
     PathTemplateValidation,
     UpdateManifestPathTemplate,
 } from '@/types';
@@ -832,7 +832,7 @@ export function useRepoWebhook(repoId: string) {
     return useQuery({
         queryKey: webhookKeys.repo(repoId),
         queryFn: async () => {
-            const response = await apiClient.get<GitHubWebhookData>(`/repos/${repoId}/webhook`);
+            const response = await apiClient.get<RepoWebhookData>(`/repos/${repoId}/webhook`);
             return response.data;
         },
         enabled: !!repoId,
@@ -845,9 +845,9 @@ export function useRegisterWebhook() {
     const queryClient = useQueryClient();
     return useMutation({
         mutationFn: async ({ repoId, githubToken }: { repoId: string; githubToken: string }) => {
-            const response = await apiClient.post<RegisterWebhookResponse>(
+            const response = await apiClient.post<RegisterRepoWebhookResponse>(
                 `/repos/${repoId}/webhook`,
-                { github_token: githubToken } as RegisterWebhookRequest
+                { github_token: githubToken } as RegisterRepoWebhookRequest
             );
             return response.data;
         },
@@ -882,7 +882,7 @@ export function useWebhookEvents(repoId: string, params: PaginationParams = { li
     return useQuery({
         queryKey: [...webhookKeys.events(repoId), params] as const,
         queryFn: async () => {
-            const response = await apiClient.get<GitHubWebhookEvent[]>(`/repos/${repoId}/webhook/events`, {
+            const response = await apiClient.get<RepoWebhookEvent[]>(`/repos/${repoId}/webhook/events`, {
                 params: { limit: params.limit, offset: params.offset },
             });
             return response.data;
