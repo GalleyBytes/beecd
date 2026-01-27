@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { ArrowLeft, RefreshCw, Server, Layers, AlertTriangle, Activity, Trash2, Plus, FileCode, X, Package, Eye, GitCompare } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Server, Layers, AlertTriangle, Activity, Trash2, FileCode, X, Package, Eye, GitCompare } from 'lucide-react';
 import { PageHeader, DataTable, Alert, Modal, ConfirmModal } from '@/components';
 import {
     useCluster,
@@ -818,7 +818,7 @@ export function ClusterDetailPage() {
                 if (!prev) return null;
                 return {
                     ...prev,
-                    service_names: prev.service_names.filter(name => name !== serviceName)
+                    service_names: (prev.service_names ?? []).filter(name => name !== serviceName)
                 };
             });
             refetchNamespaces();
