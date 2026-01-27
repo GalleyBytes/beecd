@@ -79,6 +79,10 @@ RUN cargo build --release --target x86_64-unknown-linux-musl -p api && \
 
 # Runtime image
 FROM scratch
+
+ARG IMAGE_SOURCE=https://github.com/galleybytes/beecd
+LABEL org.opencontainers.image.source=${IMAGE_SOURCE}
+
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=builder /usr/local/bin/hivehq /usr/local/bin/hivehq
 COPY --from=ui-builder /ui/dist dist

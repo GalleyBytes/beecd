@@ -8,7 +8,8 @@ import {
     Menu,
     X,
     User,
-    LogOut
+    LogOut,
+    Settings
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { ThemeToggle } from '@/components';
@@ -21,6 +22,7 @@ const navigation = [
     { name: 'Services', href: '/services', icon: Layers },
     { name: 'Repositories', href: '/repos', icon: FolderGit2 },
     { name: 'Cluster Groups', href: '/cluster-groups', icon: GitBranch },
+    { name: 'Settings', href: '/settings', icon: Settings },
 ];
 
 export function MainLayout() {
@@ -37,7 +39,7 @@ export function MainLayout() {
         queryKey: ['auth', 'me'],
         queryFn: async () => {
             const res = await apiClient.get('/auth/me');
-            return res.data as { username?: string };
+            return res.data as { username?: string; tenant_name?: string; tenant_id?: string };
         },
         retry: false,
     });
@@ -183,9 +185,6 @@ export function MainLayout() {
                             );
                         })}
                     </nav>
-                    <div className="flex-shrink-0 border-t border-gray-800 p-4">
-                        <ThemeToggle />
-                    </div>
                 </div>
             </div>
 
@@ -235,11 +234,22 @@ export function MainLayout() {
                                     className={`absolute right-0 top-full pt-2 ${userMenuOpen ? 'block' : 'hidden'}`}
                                     ref={userMenuDropdownRef}
                                 >
-                                    <div className="w-48 rounded-md shadow bg-white dark:bg-gray-800 ring-1 ring-black ring-opacity-5">
-                                        <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700">
+                                    <div className="w-56 rounded-md shadow bg-white dark:bg-gray-800 ring-1 ring-black ring-opacity-5">
+                                        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
                                             <div className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
                                                 {me?.username || 'User'}
                                             </div>
+                                            {me?.tenant_name && (
+                                                <div className="text-xs text-gray-500 dark:text-gray-400 truncate mt-1">
+                                                    {me.tenant_name}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+                                            <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">
+                                                Theme
+                                            </div>
+                                            <ThemeToggle />
                                         </div>
                                         <button
                                             type="button"
@@ -251,9 +261,6 @@ export function MainLayout() {
                                         </button>
                                     </div>
                                 </div>
-                            </div>
-                            <div className="lg:hidden">
-                                <ThemeToggle />
                             </div>
                         </div>
                     </div>

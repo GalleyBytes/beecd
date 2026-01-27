@@ -6,7 +6,7 @@ use http::Request as HttpRequest;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{postgres::Postgres, Pool};
+use sqlx::{postgres::Postgres, Executor, Pool};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -14,6 +14,43 @@ use tonic::Status;
 use tower::{Layer, Service};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Tenant context extracted from JWT claims.
+/// This is inserted into tonic request extensions by the auth interceptor.
+#[derive(Debug, Clone)]
+pub struct TenantContext {
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+    pub cluster_id: Uuid,
+    pub username: String,
+    pub tenant_domain: Option<String>, // Queried lazily when needed for logging
+}
+
+impl TenantContext {
+    /// Extract tenant context from tonic request extensions.
+    /// Returns an error if the request is not authenticated.
+    pub fn from_request<T>(request: &tonic::Request<T>) -> Result<Self, Status> {
+        request
+            .extensions()
+            .get::<TenantContext>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing tenant context"))
+    }
+}
+
+/// Set tenant context for RLS in a database transaction or connection.
+/// This must be called at the start of any transaction that accesses tenant-scoped data.
+pub async fn set_tenant_context<'e, E>(executor: E, tenant_id: Uuid) -> Result<(), Status>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query("SELECT set_config('app.tenant_id', $1::text, true)")
+        .bind(tenant_id.to_string())
+        .execute(executor)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to set tenant context: {}", e)))?;
+    Ok(())
+}
 
 /// Decode JWT secret from environment variable.
 /// Supports both base64-encoded secrets (e.g., from `openssl rand -base64 32`)
@@ -64,6 +101,7 @@ fn decode_jwt_secret() -> Result<Vec<u8>, Status> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,        // Subject: username
+    pub tenant_id: String,  // Tenant UUID (for RLS context)
     pub cluster_id: String, // Cluster UUID
     pub user_id: String,    // User UUID
     pub iat: i64,           // Issued at (Unix timestamp)
@@ -143,22 +181,30 @@ where
                         // Validate JWT
                         match validate_access_token(token) {
                             Ok(claims) => {
-                                debug!("JWT auth success: user={}, path={}", claims.sub, uri_path);
+                                debug!("[tenant:{}] JWT auth success: user={}, path={}", claims.tenant_id, claims.sub, uri_path);
 
-                                // Update cluster check-in time
-                                if let Ok(cluster_id) = Uuid::parse_str(&claims.cluster_id) {
+                                // Update cluster check-in time with tenant context for RLS
+                                if let (Ok(cluster_id), Ok(tenant_id)) = (
+                                    Uuid::parse_str(&claims.cluster_id),
+                                    Uuid::parse_str(&claims.tenant_id),
+                                ) {
                                     if !cluster_id.is_nil() {
-                                        let _ = sqlx::query(
-                                            "UPDATE clusters SET last_check_in_at = NOW() WHERE id = $1",
-                                        )
-                                        .bind(cluster_id)
-                                        .execute(&db)
-                                        .await;
+                                        // Best-effort update in transaction with RLS context
+                                        if let Ok(mut tx) = db.begin().await {
+                                            let _ = set_tenant_context(&mut *tx, tenant_id).await;
+                                            let _ = sqlx::query(
+                                                "UPDATE clusters SET last_check_in_at = NOW() WHERE id = $1",
+                                            )
+                                            .bind(cluster_id)
+                                            .execute(&mut *tx)
+                                            .await;
+                                            let _ = tx.commit().await;
+                                        }
                                     }
                                 }
 
-                                // TODO: Inject claims into request extensions for downstream use
-                                // req.extensions_mut().insert(claims);
+                                // Note: TenantContext is injected by tonic interceptor (auth_interceptor)
+                                // The tower layer only handles cluster check-in updates
 
                                 return inner.call(req).await;
                             }
@@ -203,6 +249,7 @@ fn get_jwt_decoding_key() -> Result<DecodingKey, Status> {
 fn create_access_token_with_secret(
     username: &str,
     user_id: Uuid,
+    tenant_id: Uuid,
     cluster_id: Uuid,
     secret: &str,
 ) -> Result<String, Status> {
@@ -215,6 +262,7 @@ fn create_access_token_with_secret(
 
     let claims = Claims {
         sub: username.to_string(),
+        tenant_id: tenant_id.to_string(),
         user_id: user_id.to_string(),
         cluster_id: cluster_id.to_string(),
         iat: now.timestamp(),
@@ -232,6 +280,7 @@ fn create_access_token_with_secret(
 pub fn create_access_token(
     username: &str,
     user_id: Uuid,
+    tenant_id: Uuid,
     cluster_id: Uuid,
 ) -> Result<String, Status> {
     let now = Utc::now();
@@ -243,6 +292,7 @@ pub fn create_access_token(
 
     let claims = Claims {
         sub: username.to_string(),
+        tenant_id: tenant_id.to_string(),
         user_id: user_id.to_string(),
         cluster_id: cluster_id.to_string(),
         iat: now.timestamp(),
@@ -284,10 +334,11 @@ pub fn hash_refresh_token(token: &str) -> String {
 pub fn create_access_token_for_test(
     username: &str,
     user_id: Uuid,
+    tenant_id: Uuid,
     cluster_id: Uuid,
     secret: &str,
 ) -> Result<String, Status> {
-    create_access_token_with_secret(username, user_id, cluster_id, secret)
+    create_access_token_with_secret(username, user_id, tenant_id, cluster_id, secret)
 }
 
 // Test-only: Validate token with custom secret (no env var needed)
@@ -302,4 +353,58 @@ pub fn validate_access_token_for_test(token: &str, secret: &str) -> Result<Claim
         .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
 
     Ok(token_data.claims)
+}
+
+/// Tonic interceptor that extracts JWT claims and injects TenantContext into request extensions.
+/// This interceptor should be applied to the gRPC service.
+///
+/// Note: This interceptor works in conjunction with the tower AuthLayer.
+/// The tower layer handles path-based auth bypass (Login, RefreshToken, Logout)
+/// and returns 401 for truly unauthenticated requests to protected endpoints.
+/// This interceptor only extracts claims from valid tokens and injects TenantContext.
+pub fn auth_interceptor(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+    // Extract Bearer token from authorization header
+    // If no auth header present, let the request through - the tower layer already
+    // handled path-based bypass for Login/RefreshToken/Logout endpoints.
+    let token = match req
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        Some(t) => t,
+        None => {
+            // No auth header - tower layer already allowed this through
+            // (either it's an auth endpoint, or tower layer would have rejected it)
+            return Ok(req);
+        }
+    };
+
+    // Validate JWT and extract claims
+    let claims = validate_access_token(token)?;
+
+    // Parse UUIDs from claims
+    let tenant_id = Uuid::parse_str(&claims.tenant_id)
+        .map_err(|_| Status::internal("Invalid tenant_id in token"))?;
+    let user_id = Uuid::parse_str(&claims.user_id)
+        .map_err(|_| Status::internal("Invalid user_id in token"))?;
+    let cluster_id = Uuid::parse_str(&claims.cluster_id)
+        .map_err(|_| Status::internal("Invalid cluster_id in token"))?;
+
+    // Create and inject tenant context
+    let tenant_ctx = TenantContext {
+        tenant_id,
+        user_id,
+        cluster_id,
+        username: claims.sub.clone(),
+        tenant_domain: None, // Queried later when needed for logging
+    };
+
+    debug!(
+        "Auth interceptor: user={}, tenant={}, cluster={}",
+        claims.sub, tenant_id, cluster_id
+    );
+
+    req.extensions_mut().insert(tenant_ctx);
+    Ok(req)
 }

@@ -3,44 +3,34 @@ import { useNavigate } from 'react-router-dom';
 import apiClient from '@/lib/api-client';
 import { ThemeToggle } from '@/components';
 
+// Check if we're on a tenant subdomain or base domain
+function getTenantFromHost(): string | null {
+    const host = window.location.hostname;
+    // Pattern: <tenant>.beecd.localhost or <tenant>.beecd.com etc
+    if (host.includes('.')) {
+        const parts = host.split('.');
+        // If more than 2 parts (e.g., tenant.beecd.localhost), first part is tenant
+        if (parts.length >= 3 || (parts.length === 2 && parts[0] !== 'beecd')) {
+            return parts[0];
+        }
+    }
+    return null; // Base domain (no tenant)
+}
+
 export function LoginPage() {
     const navigate = useNavigate();
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    const [mode, setMode] = useState<'login' | 'bootstrap'>('login');
-    const [bootstrapAvailable, setBootstrapAvailable] = useState<boolean>(false);
+    const tenantSlug = getTenantFromHost();
+    const isBaseDomain = tenantSlug === null;
+
+    // Two-step flow for base domain: first ask for tenant name
+    const [step] = useState<'tenant' | 'credentials'>(isBaseDomain ? 'tenant' : 'credentials');
+    const [tenantName, setTenantName] = useState('');
+
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
-
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            try {
-                const res = await apiClient.get('/auth/bootstrap/status');
-                const required = !!res.data?.bootstrap_required;
-                if (!cancelled) {
-                    setBootstrapAvailable(required);
-                    if (!required && mode === 'bootstrap') {
-                        setMode('login');
-                    }
-                }
-            } catch {
-                // If status check fails, default to hiding bootstrap. It's safer.
-                if (!cancelled) {
-                    setBootstrapAvailable(false);
-                    if (mode === 'bootstrap') {
-                        setMode('login');
-                    }
-                }
-            }
-        })();
-
-        return () => {
-            cancelled = true;
-        };
-        // mode is intentionally included so we can force-switch back to login if needed.
-    }, [mode]);
 
     const handleSubmit = async (e: FormEvent) => {
         e.preventDefault();
@@ -48,17 +38,29 @@ export function LoginPage() {
         setError(null);
 
         try {
-            const path = mode === 'bootstrap' ? '/auth/bootstrap' : '/auth/login';
-            await apiClient.post(path, {
+            // Base domain two-step flow: redirect to tenant subdomain
+            if (isBaseDomain && step === 'tenant') {
+                const slug = tenantName.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+                if (!slug) {
+                    setError('Please enter a valid tenant name');
+                    setLoading(false);
+                    return;
+                }
+                // Redirect to tenant subdomain
+                const protocol = window.location.protocol;
+                const baseDomain = window.location.hostname;
+                const port = window.location.port ? `:${window.location.port}` : '';
+                window.location.href = `${protocol}//${slug}.${baseDomain}${port}/login`;
+                return;
+            }
+
+            // Actual login (either from tenant subdomain or after redirect)
+            await apiClient.post('/auth/login', {
                 username: username.trim(),
                 password,
             });
             navigate('/');
         } catch (err: any) {
-            if (mode === 'bootstrap' && err?.response?.status === 409) {
-                setBootstrapAvailable(false);
-                setMode('login');
-            }
             const msg =
                 err?.response?.data && typeof err.response.data === 'string'
                     ? err.response.data
@@ -93,59 +95,119 @@ export function LoginPage() {
 
                 <div className="space-y-6">
                     <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow dark:shadow-gray-900">
-                        <div className="flex items-center justify-between mb-4">
-                            <h3 className="text-lg font-medium text-gray-900 dark:text-white">
-                                {mode === 'bootstrap' ? 'Initial Setup' : 'Sign in'}
-                            </h3>
-                            {bootstrapAvailable && (
-                                <button
-                                    type="button"
-                                    onClick={() => setMode(mode === 'login' ? 'bootstrap' : 'login')}
-                                    className="text-sm text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
-                                >
-                                    {mode === 'login' ? 'Create first user' : 'Back to login'}
-                                </button>
-                            )}
-                        </div>
+                        {isBaseDomain && step === 'tenant' ? (
+                            // Step 1: Ask for tenant name at base domain
+                            <>
+                                <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-4">
+                                    Enter your tenant
+                                </h3>
+                                <form onSubmit={handleSubmit} className="space-y-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                            Tenant Name
+                                        </label>
+                                        <input
+                                            type="text"
+                                            value={tenantName}
+                                            onChange={(e) => setTenantName(e.target.value)}
+                                            placeholder="your-company"
+                                            autoFocus
+                                            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                                        />
+                                    </div>
+                                    <button
+                                        type="submit"
+                                        disabled={loading || !tenantName.trim()}
+                                        className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-gray-800 disabled:opacity-50"
+                                    >
+                                        {loading ? 'Working...' : 'Continue'}
+                                    </button>
+                                </form>
+                                <div className="mt-4 text-center">
+                                    <button
+                                        type="button"
+                                        onClick={() => navigate('/register')}
+                                        className="text-sm text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+                                    >
+                                        Don't have a tenant? Register here
+                                    </button>
+                                </div>
+                            </>
+                        ) : (
+                            // Step 2: Username/password (either on tenant subdomain or after redirect)
+                            <>
+                                <div className="mb-4">
+                                    <h3 className="text-lg font-medium text-gray-900 dark:text-white">
+                                        Sign in
+                                    </h3>
+                                </div>
 
-                        <form onSubmit={handleSubmit} className="space-y-4">
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                                    Username
-                                </label>
-                                <input
-                                    type="text"
-                                    value={username}
-                                    onChange={(e) => setUsername(e.target.value)}
-                                    autoComplete="username"
-                                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                                />
-                            </div>
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                                    Password
-                                </label>
-                                <input
-                                    type="password"
-                                    value={password}
-                                    onChange={(e) => setPassword(e.target.value)}
-                                    autoComplete={mode === 'bootstrap' ? 'new-password' : 'current-password'}
-                                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                                />
-                            </div>
+                                <form onSubmit={handleSubmit} className="space-y-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                            Username
+                                        </label>
+                                        <input
+                                            type="text"
+                                            value={username}
+                                            onChange={(e) => setUsername(e.target.value)}
+                                            autoComplete="username"
+                                            autoFocus
+                                            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                            Password
+                                        </label>
+                                        <input
+                                            type="password"
+                                            value={password}
+                                            onChange={(e) => setPassword(e.target.value)}
+                                            autoComplete="current-password"
+                                            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                                        />
+                                    </div>
 
-                            <button
-                                type="submit"
-                                disabled={loading || !username.trim() || !password.trim()}
-                                className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-gray-800 disabled:opacity-50"
-                            >
-                                {loading
-                                    ? 'Working...'
-                                    : mode === 'bootstrap'
-                                        ? 'Create User'
-                                        : 'Sign In'}
-                            </button>
-                        </form>
+                                    <button
+                                        type="submit"
+                                        disabled={loading || !username.trim() || !password.trim()}
+                                        className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 dark:focus:ring-offset-gray-800 disabled:opacity-50"
+                                    >
+                                        {loading ? 'Working...' : 'Sign In'}
+                                    </button>
+                                </form>
+
+                                {!isBaseDomain && (
+                                    <div className="mt-4 text-center">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                const protocol = window.location.protocol;
+                                                const baseDomain = window.location.hostname.split('.').slice(1).join('.');
+                                                const port = window.location.port ? `:${window.location.port}` : '';
+                                                window.location.href = `${protocol}//${baseDomain}${port}/login`;
+                                            }}
+                                            className="text-sm text-gray-600 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300 underline"
+                                        >
+                                            Change tenant
+                                        </button>
+                                    </div>
+                                )}
+
+                                {isBaseDomain && (
+                                    <div className="mt-4 text-center">
+                                        <button
+                                            type="button"
+                                            onClick={() => navigate('/register')}
+                                            className="text-sm text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+                                        >
+                                            Don't have a tenant? Register here
+                                        </button>
+                                    </div>
+                                )}
+                            </>
+                        )}
                     </div>
                 </div>
             </div>

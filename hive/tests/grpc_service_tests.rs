@@ -1,16 +1,17 @@
 mod common;
 
-use common::{cleanup_test_data, create_test_cluster, setup_test_db};
+use common::{cleanup_test_data, create_test_cluster, setup_test_db, get_test_tenant_id};
 use sqlx::Row;
 use uuid::Uuid;
 
 // Helper to create test namespace
 async fn create_test_namespace(pool: &sqlx::PgPool, cluster_id: Uuid, name: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO namespaces (id, name, cluster_id) VALUES (gen_random_uuid(), $1, $2) RETURNING id"
+        "INSERT INTO namespaces (id, name, cluster_id, tenant_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id"
     )
     .bind(name)
     .bind(cluster_id)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test namespace")
@@ -19,10 +20,11 @@ async fn create_test_namespace(pool: &sqlx::PgPool, cluster_id: Uuid, name: &str
 // Helper to create test repository
 async fn create_test_repo(pool: &sqlx::PgPool, org: &str, repo: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO repos (id, org, repo) VALUES (gen_random_uuid(), $1, $2) RETURNING id",
+        "INSERT INTO repos (id, org, repo, tenant_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id",
     )
     .bind(org)
     .bind(repo)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test repo")
@@ -31,10 +33,11 @@ async fn create_test_repo(pool: &sqlx::PgPool, org: &str, repo: &str) -> Uuid {
 // Helper to create test repo branch
 async fn create_test_repo_branch(pool: &sqlx::PgPool, repo_id: Uuid, branch: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO repo_branches (id, repo_id, branch) VALUES (gen_random_uuid(), $1, $2) RETURNING id"
+        "INSERT INTO repo_branches (id, repo_id, branch, tenant_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id"
     )
     .bind(repo_id)
     .bind(branch)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test repo branch")
@@ -50,15 +53,16 @@ async fn create_test_release(
     sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO releases (
-            id, service_id, namespace_id, hash, path, name, version, repo_branch_id, git_sha, manually_selected_at
+            id, service_id, namespace_id, hash, path, name, version, repo_branch_id, git_sha, manually_selected_at, tenant_id
         ) VALUES (
-            gen_random_uuid(), gen_random_uuid(), $1, 'testhash123', '/manifests/svc.yaml', $2, '1.0.0', $3, 'deadbeef', NOW()
+            gen_random_uuid(), gen_random_uuid(), $1, 'testhash123', '/manifests/svc.yaml', $2, '1.0.0', $3, 'deadbeef', NOW(), $4
         ) RETURNING id
         "#
     )
     .bind(namespace_id)
     .bind(name)
     .bind(repo_branch_id)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test release")
@@ -67,10 +71,11 @@ async fn create_test_release(
 // Helper to save hive error
 async fn save_hive_error(pool: &sqlx::PgPool, cluster_id: Uuid, message: &str) {
     sqlx::query(
-        "INSERT INTO hive_errors (cluster_id, message, is_deprecated) VALUES ($1, $2, false)",
+        "INSERT INTO hive_errors (cluster_id, message, is_deprecated, tenant_id) VALUES ($1, $2, false, $3)",
     )
     .bind(cluster_id)
     .bind(message)
+    .bind(get_test_tenant_id())
     .execute(pool)
     .await
     .expect("Failed to save hive error");
@@ -198,9 +203,10 @@ async fn test_log_release_error_creates_error_record() {
     let release_id = create_test_release(&pool, namespace_id, repo_branch_id, release_name).await;
 
     // Simulate logging a release error
-    sqlx::query("INSERT INTO release_errors (release_id, message) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO release_errors (release_id, message, tenant_id) VALUES ($1, $2, $3)")
         .bind(release_id)
         .bind(error_msg)
+        .bind(get_test_tenant_id())
         .execute(&pool)
         .await
         .expect("Failed to insert release error");

@@ -78,6 +78,10 @@ RUN apk add --no-cache curl && \
 
 # Runtime image
 FROM alpine:3.19.1
+
+ARG IMAGE_SOURCE=https://github.com/galleybytes/beecd
+LABEL org.opencontainers.image.source=${IMAGE_SOURCE}
+
 RUN apk add --no-cache gpg gpg-agent ca-certificates
 COPY --from=builder /usr/local/bin/hive /usr/local/bin/hive
 COPY --from=sops /usr/local/bin/sops /usr/local/bin/sops

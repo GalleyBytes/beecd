@@ -16,7 +16,9 @@ import {
   ClusterGroupsPage,
   ClusterGroupDetailPage,
   ReleaseDetailPage,
-  LoginPage
+  LoginPage,
+  RegisterPage,
+  SettingsPage
 } from '@/pages';
 
 const queryClient = new QueryClient({
@@ -53,8 +55,9 @@ function App() {
         <BrowserRouter>
           <AuthRedirectHandler />
           <Routes>
-            {/* Login page - outside main layout */}
+            {/* Public routes - outside main layout */}
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/register" element={<RegisterPage />} />
 
             {/* Main app routes */}
             <Route path="/" element={<MainLayout />}>
@@ -69,6 +72,7 @@ function App() {
               <Route path="cluster-groups" element={<ClusterGroupsPage />} />
               <Route path="cluster-groups/:id" element={<ClusterGroupDetailPage />} />
               <Route path="releases/:namespaceId/:releaseName" element={<ReleaseDetailPage />} />
+              <Route path="settings" element={<SettingsPage />} />
               <Route path="*" element={<div className="text-center py-12"><h1 className="text-2xl font-bold text-gray-900 dark:text-white">404 - Not Found</h1></div>} />
             </Route>
           </Routes>

@@ -7,6 +7,10 @@ pub mod util;
 #[cfg(test)]
 mod auth_tests;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 #[derive(Clone)]
 pub struct ServerState {
     pub pool: sqlx::Pool<sqlx::Postgres>,
@@ -24,4 +28,6 @@ pub struct ServerState {
     /// This must be externally reachable by GitHub, e.g.:
     ///   https://hive-hq.example.com/api/webhooks/github
     pub github_webhook_callback_url: Option<String>,
+    /// In-memory, per-tenant encrypted secret cache. No DB persistence.
+    pub secret_cache: Arc<RwLock<HashMap<(uuid::Uuid, String), (Vec<u8>, Vec<u8>, i16, chrono::DateTime<chrono::Utc>)>>>,
 }

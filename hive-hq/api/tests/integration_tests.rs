@@ -13,13 +13,20 @@ async fn test_sync_cluster_releases_basic_flow() {
         .await
         .expect("Failed to setup test environment");
 
-    // Create test fixtures
-    let cluster_id = create_test_cluster(&env.pool).await;
-    let namespace_id = create_test_namespace(&env.pool, cluster_id).await;
-    let (_, branch_id) = create_test_repo(&env.pool).await;
+    // Create test fixtures with tenant_id
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
+    let namespace_id = create_test_namespace(&env.pool, cluster_id, env.tenant_id).await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
 
     // Create initial release
-    let release_id = create_test_release(&env.pool, namespace_id, branch_id, "test-app").await;
+    let release_id = create_test_release(
+        &env.pool,
+        namespace_id,
+        branch_id,
+        "test-app",
+        env.tenant_id,
+    )
+    .await;
 
     // Verify release was created
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM releases WHERE id = $1")
@@ -40,27 +47,28 @@ async fn test_transaction_atomicity_on_error() {
         .await
         .expect("Failed to setup test environment");
 
-    let cluster_id = create_test_cluster(&env.pool).await;
-    let namespace_id = create_test_namespace(&env.pool, cluster_id).await;
-    let (_, branch_id) = create_test_repo(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
+    let namespace_id = create_test_namespace(&env.pool, cluster_id, env.tenant_id).await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
 
     // Start a transaction
     let mut tx = env.pool.begin().await.expect("Failed to start transaction");
 
-    // Insert a release within the transaction
+    // Insert a release within the transaction (includes tenant_id)
     let release_id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO releases (
             id, namespace_id, name, path, repo_branch_id,
-            hash, version, git_sha
+            hash, version, git_sha, tenant_id
         )
-        VALUES ($1, $2, 'test-app', '/test/path', $3, 'hash123', 'v1.0', 'abc123')
+        VALUES ($1, $2, 'test-app', '/test/path', $3, 'hash123', 'v1.0', 'abc123', $4)
         "#,
     )
     .bind(release_id)
     .bind(namespace_id)
     .bind(branch_id)
+    .bind(env.tenant_id)
     .execute(&mut *tx)
     .await
     .expect("Failed to insert release");
@@ -90,9 +98,9 @@ async fn test_batch_operations_within_limits() {
         .await
         .expect("Failed to setup test environment");
 
-    let cluster_id = create_test_cluster(&env.pool).await;
-    let namespace_id = create_test_namespace(&env.pool, cluster_id).await;
-    let (_, branch_id) = create_test_repo(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
+    let namespace_id = create_test_namespace(&env.pool, cluster_id, env.tenant_id).await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
 
     // Create 100 releases to test batch operations
     for i in 0..100 {
@@ -101,6 +109,7 @@ async fn test_batch_operations_within_limits() {
             namespace_id,
             branch_id,
             &format!("test-app-{}", i),
+            env.tenant_id,
         )
         .await;
     }
@@ -141,17 +150,17 @@ async fn test_namespace_isolation() {
         .await
         .expect("Failed to setup test environment");
 
-    let cluster_id = create_test_cluster(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
 
     // Create two namespaces
-    let ns1_id = create_test_namespace(&env.pool, cluster_id).await;
-    let ns2_id = create_test_namespace(&env.pool, cluster_id).await;
+    let ns1_id = create_test_namespace(&env.pool, cluster_id, env.tenant_id).await;
+    let ns2_id = create_test_namespace(&env.pool, cluster_id, env.tenant_id).await;
 
-    let (_, branch_id) = create_test_repo(&env.pool).await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
 
     // Create releases in both namespaces
-    create_test_release(&env.pool, ns1_id, branch_id, "app-ns1").await;
-    create_test_release(&env.pool, ns2_id, branch_id, "app-ns2").await;
+    create_test_release(&env.pool, ns1_id, branch_id, "app-ns1", env.tenant_id).await;
+    create_test_release(&env.pool, ns2_id, branch_id, "app-ns2", env.tenant_id).await;
 
     // Verify namespace 1 only has its own release
     let ns1_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM releases WHERE namespace_id = $1")

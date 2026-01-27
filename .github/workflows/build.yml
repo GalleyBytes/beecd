@@ -1,0 +1,271 @@
+name: Build and Push Images
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # ============================================================================
+  # Pre-checks: Validate commits and version
+  # ============================================================================
+  pre-checks:
+    runs-on: ubuntu-latest
+    outputs:
+      skip_build: ${{ steps.check-commits.outputs.skip_build }}
+      version: ${{ steps.version.outputs.version }}
+      is_release: ${{ steps.check-event.outputs.is_release }}
+      image_prefix: ${{ steps.lowercase.outputs.image_prefix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Convert repository owner to lowercase
+        id: lowercase
+        run: |
+          echo "image_prefix=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+
+      - name: Check event type
+        id: check-event
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/master" ]]; then
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_release=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate commit messages (commitlint style)
+        id: commitlint
+        run: |
+          # Get commits to check
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            COMMITS=$(git log --format="%s" origin/master..HEAD)
+          else
+            # On push, check the pushed commit
+            COMMITS=$(git log --format="%s" -1)
+          fi
+
+          # Conventional commit regex
+          PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+"
+
+          echo "Checking commits..."
+          FAILED=false
+          while IFS= read -r msg; do
+            if [[ -z "$msg" ]]; then
+              continue
+            fi
+            # Skip merge commits
+            if [[ "$msg" =~ ^Merge ]]; then
+              echo "Skipping merge commit: $msg"
+              continue
+            fi
+            if [[ ! "$msg" =~ $PATTERN ]]; then
+              echo "Invalid commit message: $msg"
+              echo "Expected format: type(scope)?: description"
+              echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+              FAILED=true
+            else
+              echo "Valid: $msg"
+            fi
+          done <<< "$COMMITS"
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "Commit message validation failed"
+            exit 1
+          fi
+
+      - name: Check if docs-only commits
+        id: check-commits
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            COMMITS=$(git log --format="%s" origin/master..HEAD)
+          else
+            COMMITS=$(git log --format="%s" -1)
+          fi
+
+          # Check if ALL commits are docs-prefixed
+          ALL_DOCS=true
+          while IFS= read -r msg; do
+            if [[ -z "$msg" ]]; then
+              continue
+            fi
+            if [[ ! "$msg" =~ ^docs ]]; then
+              ALL_DOCS=false
+              break
+            fi
+          done <<< "$COMMITS"
+
+          if [[ "$ALL_DOCS" == "true" ]]; then
+            echo "All commits are docs-only, skipping build"
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Check version differs from master (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          
+          git fetch origin master
+          git checkout origin/master -- Cargo.toml
+          MASTER_VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          git checkout HEAD -- Cargo.toml
+
+          echo "PR version: $PR_VERSION"
+          echo "Master version: $MASTER_VERSION"
+
+          if [[ "$PR_VERSION" == "$MASTER_VERSION" ]]; then
+            echo "Version must be bumped from master version ($MASTER_VERSION)"
+            exit 1
+          fi
+
+      - name: Check breaking change requires major bump (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          COMMITS=$(git log --format="%s" origin/master..HEAD)
+          
+          HAS_BREAKING=false
+          while IFS= read -r msg; do
+            # Check for breaking change indicator (! before :) or BREAKING CHANGE in body
+            if [[ "$msg" =~ !: ]] || [[ "$msg" =~ BREAKING\ CHANGE ]]; then
+              HAS_BREAKING=true
+              break
+            fi
+          done <<< "$COMMITS"
+
+          if [[ "$HAS_BREAKING" == "true" ]]; then
+            echo "Breaking change detected in commits"
+            
+            PR_VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+            
+            git fetch origin master
+            git checkout origin/master -- Cargo.toml
+            MASTER_VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+            git checkout HEAD -- Cargo.toml
+
+            # Extract major versions
+            PR_MAJOR=$(echo "$PR_VERSION" | cut -d. -f1)
+            MASTER_MAJOR=$(echo "$MASTER_VERSION" | cut -d. -f1)
+
+            echo "PR major: $PR_MAJOR, Master major: $MASTER_MAJOR"
+
+            if [[ "$PR_MAJOR" -le "$MASTER_MAJOR" ]]; then
+              echo "Breaking change requires major version bump (current: $MASTER_VERSION, PR: $PR_VERSION)"
+              exit 1
+            fi
+          fi
+
+  # ============================================================================
+  # Build images
+  # ============================================================================
+  build:
+    needs: pre-checks
+    if: needs.pre-checks.outputs.skip_build != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      matrix:
+        service: [agent, hive, hive-hq]
+        include:
+          - service: agent
+            image_name: hive-agent
+            dockerfile: agent/Dockerfile
+          - service: hive
+            image_name: hive-server
+            dockerfile: hive/Dockerfile
+          - service: hive-hq
+            image_name: hive-hq
+            dockerfile: hive-hq/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: tags
+        run: |
+          VERSION="${{ needs.pre-checks.outputs.version }}"
+          IS_RELEASE="${{ needs.pre-checks.outputs.is_release }}"
+          IMAGE="${{ needs.pre-checks.outputs.image_prefix }}/${{ matrix.image_name }}"
+
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            # Push to master: use version tag and latest
+            echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest" >> $GITHUB_OUTPUT
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          else
+            # PR: use version with timestamp suffix
+            TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            TAG="${VERSION}-${TIMESTAMP}-${SHORT_SHA}"
+            echo "tags=${IMAGE}:${TAG}" >> $GITHUB_OUTPUT
+            echo "version=${TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            BUILD_VERSION=${{ steps.tags.outputs.version }}
+            IMAGE_SOURCE=https://github.com/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # Create git tag on release
+  # ============================================================================
+  tag-release:
+    needs: [pre-checks, build]
+    if: needs.pre-checks.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and push tag
+        run: |
+          VERSION="v${{ needs.pre-checks.outputs.version }}"
+          
+          # Check if tag already exists
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+          echo "Created tag $VERSION"

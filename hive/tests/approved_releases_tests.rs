@@ -1,15 +1,16 @@
 mod common;
 
-use common::{cleanup_test_data, create_test_cluster, setup_test_db};
+use common::{cleanup_test_data, create_test_cluster, setup_test_db, get_test_tenant_id};
 use uuid::Uuid;
 
 // Helper to create test namespace
 async fn create_test_namespace(pool: &sqlx::PgPool, cluster_id: Uuid, name: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO namespaces (id, name, cluster_id) VALUES (gen_random_uuid(), $1, $2) RETURNING id"
+        "INSERT INTO namespaces (id, name, cluster_id, tenant_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id"
     )
     .bind(name)
     .bind(cluster_id)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test namespace")
@@ -18,10 +19,11 @@ async fn create_test_namespace(pool: &sqlx::PgPool, cluster_id: Uuid, name: &str
 // Helper to create test repository
 async fn create_test_repo(pool: &sqlx::PgPool, org: &str, repo: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO repos (id, org, repo) VALUES (gen_random_uuid(), $1, $2) RETURNING id",
+        "INSERT INTO repos (id, org, repo, tenant_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id",
     )
     .bind(org)
     .bind(repo)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test repo")
@@ -30,10 +32,11 @@ async fn create_test_repo(pool: &sqlx::PgPool, org: &str, repo: &str) -> Uuid {
 // Helper to create test repo branch
 async fn create_test_repo_branch(pool: &sqlx::PgPool, repo_id: Uuid, branch: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO repo_branches (id, repo_id, branch) VALUES (gen_random_uuid(), $1, $2) RETURNING id"
+        "INSERT INTO repo_branches (id, repo_id, branch, tenant_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id"
     )
     .bind(repo_id)
     .bind(branch)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create test repo branch")
@@ -50,16 +53,17 @@ async fn create_approved_release(
         r#"
         INSERT INTO releases (
             id, service_id, namespace_id, hash, path, name, version, repo_branch_id, 
-            git_sha, approved_at, approved_by
+            git_sha, approved_at, approved_by, tenant_id
         ) VALUES (
             gen_random_uuid(), gen_random_uuid(), $1, 'hash123', '/manifests/svc.yaml', 
-            $2, '1.0.0', $3, 'deadbeef', NOW(), 'admin'
+            $2, '1.0.0', $3, 'deadbeef', NOW(), 'admin', $4
         ) RETURNING id
         "#,
     )
     .bind(namespace_id)
     .bind(name)
     .bind(repo_branch_id)
+    .bind(get_test_tenant_id())
     .fetch_one(pool)
     .await
     .expect("Failed to create approved release")

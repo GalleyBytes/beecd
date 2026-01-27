@@ -34,6 +34,15 @@ pub struct ServerState {
     jwt_secret_bytes: Vec<u8>,
     read_replica_wait_in_ms: u64,
     github_webhook_callback_url: Option<String>,
+    /// In-memory, per-tenant encrypted secret cache. No DB persistence.
+    secret_cache: std::sync::Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<
+                (uuid::Uuid, String),
+                (Vec<u8>, Vec<u8>, i16, chrono::DateTime<chrono::Utc>),
+            >,
+        >,
+    >,
 }
 
 /// Decode JWT secret from string.
@@ -362,6 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jwt_secret_bytes,
         read_replica_wait_in_ms: read_replica_wait_in_ms.parse().unwrap_or(75),
         github_webhook_callback_url,
+        secret_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
     };
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -381,7 +393,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/auth/bootstrap/status",
             get(handler::ui_auth_bootstrap_status),
         )
-        .route("/api/auth/login", post(handler::ui_auth_login));
+        .route("/api/auth/login", post(handler::ui_auth_login))
+        .route("/api/tenants/register", post(handler::register_tenant))
+        // temporary alias to handle environments that double-prefix /api
+        .route("/api/api/tenants/register", post(handler::register_tenant));
 
     #[cfg(feature = "dev-mode")]
     let public_routes = public_routes.route("/api/free-token", get(handler::free_token));
@@ -411,6 +426,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(cors)
         .route("/api/auth/me", get(handler::ui_auth_me))
         .route("/api/auth/logout", post(handler::ui_auth_logout))
+        .route(
+            "/api/secrets",
+            get(handler::list_secrets).post(handler::create_secret),
+        )
+        .route("/api/secrets/{purpose}", delete(handler::delete_secret))
+        .route(
+            "/api/secrets/{purpose}/encrypted",
+            get(handler::get_encrypted_secret),
+        )
         .route("/api/cluster-defaults", get(handler::get_cluster_defaults))
         .route(
             "/api/clusters",

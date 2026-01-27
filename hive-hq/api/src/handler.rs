@@ -25,6 +25,184 @@ use utoipa::ToSchema;
 
 use uuid::Uuid;
 
+/// Extract tenant_id from Host header
+/// Looks up the domain in the tenants table and returns the tenant_id
+async fn extract_tenant_from_request(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Uuid, (StatusCode, String)> {
+    // Prefer X-Forwarded-Host when behind dev proxy; fall back to Host.
+    // If those are unusable (localhost), try Origin then Referer to recover the tenant subdomain.
+    let xf_host_name = axum::http::HeaderName::from_static("x-forwarded-host");
+    let mut host = headers
+        .get(&xf_host_name)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+
+    // Extract slug from host (first label before the first dot)
+    let slug = host
+        .split(':')
+        .next()
+        .unwrap_or(&host)
+        .split('.')
+        .next()
+        .unwrap_or("");
+
+    tracing::debug!("extract_tenant_from_request: host={}, slug={}", host, slug);
+
+    if slug.is_empty() || slug == "localhost" || slug == "beecd" {
+        // Try Origin header to recover real host
+        if let Some(origin_val) = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|h| h.to_str().ok())
+        {
+            // origin like: http://acme2.localhost:5173
+            let origin_host = origin_val
+                .split("//")
+                .nth(1)
+                .map(|s| s.split('/').next().unwrap_or(s))
+                .unwrap_or(origin_val);
+            host = origin_host.to_string();
+        } else if let Some(referer_val) = headers
+            .get(axum::http::header::REFERER)
+            .and_then(|h| h.to_str().ok())
+        {
+            let ref_host = referer_val
+                .split("//")
+                .nth(1)
+                .map(|s| s.split('/').next().unwrap_or(s))
+                .unwrap_or(referer_val);
+            host = ref_host.to_string();
+        }
+
+        let slug2 = host
+            .split(':')
+            .next()
+            .unwrap_or(&host)
+            .split('.')
+            .next()
+            .unwrap_or("");
+
+        if slug2.is_empty() || slug2 == "localhost" || slug2 == "beecd" {
+            tracing::warn!(
+                "Invalid slug from host (after origin/referer fallback): {}",
+                host
+            );
+            return Err((
+                StatusCode::NOT_FOUND,
+                "No tenant subdomain found".to_string(),
+            ));
+        }
+
+        // Use recovered slug
+        let result = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT id FROM tenants
+            WHERE domain = $1 AND status = 'active' AND deleted_at IS NULL
+            "#,
+        )
+        .bind(slug2)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to lookup tenant by slug {}: {:?}", slug2, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve tenant".to_string(),
+            )
+        })?;
+
+        return result.ok_or_else(|| {
+            tracing::warn!("Tenant not found for slug: {}", slug2);
+            (
+                StatusCode::NOT_FOUND,
+                format!("Tenant not found for subdomain: {}", slug2),
+            )
+        });
+    }
+
+    // Look up tenant by slug (domain column stores just the slug)
+    let result = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id FROM tenants
+        WHERE domain = $1 AND status = 'active' AND deleted_at IS NULL
+        "#,
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to lookup tenant by slug {}: {:?}", slug, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve tenant".to_string(),
+        )
+    })?;
+
+    result.ok_or_else(|| {
+        tracing::warn!("Tenant not found for slug: {}", slug);
+        (
+            StatusCode::NOT_FOUND,
+            format!("Tenant not found for subdomain: {}", slug),
+        )
+    })
+}
+
+/// Set the RLS context for the current request
+/// This sets app.tenant_id which is used by RLS policies
+async fn set_tenant_context(
+    client: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let query = format!("SET LOCAL app.tenant_id = '{}';", tenant_id);
+    sqlx::query(&query)
+        .execute(&mut **client)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to set tenant context: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to set tenant context".to_string(),
+            )
+        })?;
+    Ok(())
+}
+
+/// Get tenant domain from tenant_id for logging
+async fn get_tenant_domain(pool: &sqlx::Pool<sqlx::Postgres>, tenant_id: Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT domain FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| tenant_id.to_string())
+}
+
+/// Get a read-only transaction with tenant context set for RLS
+/// This ensures all read queries respect tenant isolation  
+/// Returns (transaction, tenant_id, tenant_domain) for logging
+async fn get_tenant_tx<'a>(
+    pool: &'a sqlx::Pool<sqlx::Postgres>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(sqlx::Transaction<'a, sqlx::Postgres>, Uuid, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(pool, headers).await?;
+    let tenant_domain = get_tenant_domain(pool, tenant_id).await;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_tenant_tx_begin"))?;
+    set_tenant_context(&mut tx, tenant_id).await?;
+    Ok((tx, tenant_id, tenant_domain))
+}
+
 /// Sanitize database errors to prevent information leakage
 /// Logs the full error server-side but returns generic message to client
 fn sanitize_db_error(e: sqlx::Error, context: &str) -> (StatusCode, String) {
@@ -218,6 +396,64 @@ impl Pagination {
     }
 }
 
+/// Crypto module for secret encryption/decryption
+mod crypto {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+
+    const NONCE_SIZE: usize = 12;
+
+    /// Encrypt plaintext using AES-256-GCM
+    pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if key.len() != 32 {
+            return Err("Key must be 32 bytes".to_string());
+        }
+
+        let cipher = Aes256Gcm::new(key.into());
+        let mut nonce_bytes = [0u8; NONCE_SIZE];
+        // In production, use a proper random source
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| format!("Failed to generate nonce: {}", e))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| format!("Encryption failed: {}", e))?;
+
+        Ok((ciphertext, nonce_bytes.to_vec()))
+    }
+
+    /// Decrypt ciphertext using AES-256-GCM
+    pub fn decrypt(key: &[u8; 32], ciphertext: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+        if key.len() != 32 {
+            return Err("Key must be 32 bytes".to_string());
+        }
+
+        if iv.len() != NONCE_SIZE {
+            return Err(format!("IV must be {} bytes", NONCE_SIZE));
+        }
+
+        let cipher = Aes256Gcm::new(key.into());
+        let nonce = Nonce::from_slice(iv);
+
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Decryption failed: {}", e))
+    }
+
+    /// Derive a key using HKDF
+    pub fn derive_key(root_key: &[u8], salt: &[u8]) -> Result<[u8; 32], String> {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        let hkdf = Hkdf::<Sha256>::new(Some(salt), root_key);
+        let mut key = [0u8; 32];
+        hkdf.expand(b"secret-encryption", &mut key)
+            .map_err(|e| format!("HKDF expansion failed: {}", e))?;
+        Ok(key)
+    }
+}
+
 /// Get beecd-hive-hq version
 #[utoipa::path(
     get,
@@ -298,6 +534,7 @@ pub async fn free_token(
     let token = generate_jwt(
         &state.jwt_secret_bytes,
         String::from("user@galleybytes.com"),
+        String::from("00000000-0000-0000-0000-000000000000"), // dev default tenant
         vec![String::from("admin")],
     )
     .map_err(|e| {
@@ -329,13 +566,15 @@ pub async fn free_token(
 )]
 pub async fn get_service(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(name): Path<String>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ServiceDefinitionData>>, (StatusCode, String)> {
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, ServiceDefinitionData>(
-            r#"
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+
+    let result = sqlx::query_as::<_, ServiceDefinitionData>(
+        r#"
         SELECT
             service_definitions.id AS service_definition_id,
             service_definitions.name AS name,
@@ -359,14 +598,19 @@ pub async fn get_service(
         ORDER BY service_definitions.name
         LIMIT $2 OFFSET $3
     "#,
-        )
-        .bind(&name)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(&name)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_service"))?;
+
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_service"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_service_commit"))?;
+
+    Ok(Json(result))
 }
 
 /// Get service data via id
@@ -384,13 +628,15 @@ pub async fn get_service(
 )]
 pub async fn get_service_definition(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ServiceDefinitionData>, (StatusCode, String)> {
     // TODO in the ui, make use of the deleted_at timestamp to inform the
     // user that this resource, while visible, can not be used while it is deleted.
-    Ok(Json(
-        sqlx::query_as::<_, ServiceDefinitionData>(
-            r#"
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+
+    let result = sqlx::query_as::<_, ServiceDefinitionData>(
+        r#"
         SELECT
             service_definitions.id AS service_definition_id,
             service_definitions.name AS name,
@@ -411,12 +657,17 @@ pub async fn get_service_definition(
         WHERE
             service_definitions.id =  $1
     "#,
-        )
-        .bind(id)
-        .fetch_one(&state.readonly_pool)
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_service_definition"))?;
+
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_service_definition"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_service_definition_commit"))?;
+
+    Ok(Json(result))
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -439,9 +690,20 @@ pub struct PutServiceData {
 )]
 pub async fn put_service_definition(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PutServiceData>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_service_definition_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
         UPDATE
@@ -454,9 +716,14 @@ pub async fn put_service_definition(
     )
     .bind(id)
     .bind(&data.source_branch_requirements)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_service_definition"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_service_definition_commit"))?;
+
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
 
@@ -479,12 +746,14 @@ pub async fn put_service_definition(
 )]
 pub async fn get_unassociated_service_definitions_for_cluster_group(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ServiceDefinitionData>>, (StatusCode, String)> {
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, ServiceDefinitionData>(
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+
+    let result = sqlx::query_as::<_, ServiceDefinitionData>(
             r#"
             SELECT
                 service_definitions.id AS service_definition_id,
@@ -528,10 +797,15 @@ pub async fn get_unassociated_service_definitions_for_cluster_group(
         .bind(id)
         .bind(pagination.limit)
         .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| sanitize_db_error(e, "get_put_unassociated_service_definitions"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_put_unassociated_service_definitions"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_unassociated_service_definitions_commit"))?;
+
+    Ok(Json(result))
 }
 
 /// Get a list of all non-deleted clusters
@@ -553,14 +827,16 @@ pub async fn get_unassociated_service_definitions_for_cluster_group(
 )]
 pub async fn get_clusters(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PaginatedResponse<Cluster>>, (StatusCode, String)> {
     let pagination = pagination.validate();
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
 
     // Get total count
     let (total,): (i64,) =
         sqlx::query_as(r#"SELECT COUNT(*) FROM clusters WHERE deleted_at IS NULL"#)
-            .fetch_one(&state.readonly_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "get_clusters_count"))?;
 
@@ -570,9 +846,13 @@ pub async fn get_clusters(
     )
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_clusters"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_clusters_commit"))?;
 
     Ok(Json(PaginatedResponse::new(
         data,
@@ -601,9 +881,12 @@ pub async fn get_clusters(
 )]
 pub async fn get_error_count(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ErrorCount>>, (StatusCode, String)> {
     let pagination = pagination.validate();
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+
     let result = sqlx::query_as(r#"
         SELECT
             clusters.id as cluster_id,
@@ -628,9 +911,14 @@ pub async fn get_error_count(
     "#)
         .bind(pagination.limit)
         .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_error_count"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_error_count_commit"))?;
+
     Ok(Json(result))
 }
 
@@ -649,13 +937,20 @@ pub async fn get_error_count(
 )]
 pub async fn get_cluster(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Cluster>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+
     let result = sqlx::query_as("SELECT * FROM clusters WHERE id = $1 AND deleted_at IS NULL")
         .bind(id)
-        .fetch_one(&state.readonly_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_cluster"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_commit"))?;
 
     Ok(Json(result))
 }
@@ -675,14 +970,19 @@ pub async fn get_cluster(
 )]
 pub async fn delete_cluster(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
     // Use transaction to ensure both operations succeed or fail together
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|e| sanitize_db_error(e, "delete_cluster_begin_transaction"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
 
     // When "soft" deleting a cluster, also delete the user that allows
     // the agent to register, effectively preventing any new queries to this cluster
@@ -729,6 +1029,7 @@ pub async fn delete_cluster(
 )]
 pub async fn post_cluster(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<types::PostCluster>,
 ) -> Result<Json<types::PostClusterResponse>, (StatusCode, String)> {
     // Validate cluster name
@@ -740,12 +1041,23 @@ pub async fn post_cluster(
         ));
     }
 
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+    let tenant_domain = get_tenant_domain(&state.pool, tenant_id).await;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_cluster_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Check if cluster already exists
     let existing_cluster: Option<types::Cluster> = sqlx::query_as(
         "SELECT id, name, metadata, version, kubernetes_version FROM clusters WHERE name = $1 AND deleted_at IS NULL"
     )
     .bind(name)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_cluster_check_existing"))?;
 
@@ -755,13 +1067,14 @@ pub async fn post_cluster(
         // Insert the cluster
         sqlx::query_as(
             r#"
-            INSERT INTO clusters (id, name)
-            VALUES (gen_random_uuid(), $1)
+            INSERT INTO clusters (id, name, tenant_id)
+            VALUES (gen_random_uuid(), $1, $2)
             RETURNING id, name, metadata, version, kubernetes_version
             "#,
         )
         .bind(name)
-        .fetch_one(&state.pool)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(database_error) => {
@@ -784,7 +1097,11 @@ pub async fn post_cluster(
                         }
                     }
                     None => {
-                        tracing::error!("Database error inserting cluster: {}", database_error);
+                        tracing::error!(
+                            "[tenant:{}] Database error inserting cluster: {}",
+                            tenant_domain,
+                            database_error
+                        );
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             String::from("Database error while creating cluster"),
@@ -793,7 +1110,11 @@ pub async fn post_cluster(
                 }
             }
             _ => {
-                tracing::error!("Unknown error inserting cluster: {}", e);
+                tracing::error!(
+                    "[tenant:{}] Unknown error inserting cluster: {}",
+                    tenant_domain,
+                    e
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     String::from("Failed to create cluster"),
@@ -806,7 +1127,7 @@ pub async fn post_cluster(
     let existing_user: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM users WHERE name = $1 AND deleted_at IS NULL")
             .bind(name)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "post_cluster_check_user"))?;
 
@@ -1123,23 +1444,28 @@ pub async fn post_cluster(
         sqlx::query("UPDATE users SET hash = $1, updated_at = NOW() WHERE name = $2")
             .bind(&hash)
             .bind(name)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "post_cluster_update_user"))?;
     } else {
         // Insert new user
         sqlx::query(
             r#"
-            INSERT INTO users (id, name, hash)
-            VALUES (gen_random_uuid(), $1, $2)
+            INSERT INTO users (id, name, hash, tenant_id)
+            VALUES (gen_random_uuid(), $1, $2, $3)
             "#,
         )
         .bind(name)
         .bind(&hash)
-        .execute(&state.pool)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "post_cluster_insert_user"))?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_cluster_commit"))?;
 
     Ok(Json(types::PostClusterResponse {
         cluster,
@@ -1170,10 +1496,13 @@ pub async fn post_cluster(
 )]
 pub async fn get_cluster_namespaces(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ClusterNamespaceServicesData>>, (StatusCode, String)> {
     let pagination = pagination.validate();
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+
     let result = sqlx::query_as(
         r#"
         SELECT
@@ -1197,9 +1526,13 @@ pub async fn get_cluster_namespaces(
     .bind(id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_cluster_namespace_data"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_namespaces_commit"))?;
 
     Ok(Json(result))
 }
@@ -1224,13 +1557,15 @@ pub async fn get_cluster_namespaces(
 )]
 pub async fn get_cluster_groups(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PaginatedResponse<ClusterGroupData>>, (StatusCode, String)> {
     let pagination = pagination.validate();
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
 
     // Get total count
     let (total,): (i64,) = sqlx::query_as(r#"SELECT COUNT(*) FROM cluster_groups"#)
-        .fetch_one(&state.readonly_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_cluster_groups_count"))?;
 
@@ -1239,9 +1574,13 @@ pub async fn get_cluster_groups(
         sqlx::query_as(r#"SELECT * FROM cluster_groups ORDER BY name LIMIT $1 OFFSET $2"#)
             .bind(pagination.limit)
             .bind(pagination.offset)
-            .fetch_all(&state.readonly_pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "get_cluster_groups"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_groups_commit"))?;
 
     Ok(Json(PaginatedResponse::new(
         data,
@@ -1267,9 +1606,11 @@ pub async fn get_cluster_groups(
 )]
 pub async fn get_cluster_cluster_groups(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ClusterClusterGroups>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let result = sqlx::query_as(
         r#"
@@ -1289,10 +1630,13 @@ pub async fn get_cluster_cluster_groups(
     .bind(id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_cluster_cluster_groups"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_cluster_groups_commit"))?;
     Ok(Json(result))
 }
 
@@ -1312,8 +1656,19 @@ pub async fn get_cluster_cluster_groups(
 )]
 pub async fn delete_group_relationship(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((cluster_id, cluster_group_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_group_relationship_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
         DELETE FROM
@@ -1325,9 +1680,13 @@ pub async fn delete_group_relationship(
     )
     .bind(cluster_id)
     .bind(cluster_group_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_group_relationship"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_group_relationship_commit"))?;
 
     tokio::time::sleep(std::time::Duration::from_millis(
         state.read_replica_wait_in_ms,
@@ -1564,9 +1923,11 @@ pub async fn sync_cluster_releases(
 )]
 pub async fn get_cluster_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ClusterServiceDefinitions>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let result = sqlx::query_as(
         r#"
@@ -1618,10 +1979,13 @@ pub async fn get_cluster_service_definitions(
     .bind(id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_cluster_service_definitions"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_service_definitions_commit"))?;
     Ok(Json(result))
 }
 
@@ -1641,6 +2005,7 @@ pub async fn get_cluster_service_definitions(
 )]
 pub async fn add_cluster_groups(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(cluster_group): Json<AddClusterGroupInput>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     if cluster_group.name.is_empty() {
@@ -1649,21 +2014,32 @@ pub async fn add_cluster_groups(
             "Null value for cluster group".to_string(),
         ));
     }
+
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "add_cluster_groups_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
-            INSERT INTO cluster_groups (id, name)
-            VALUES (
-                (
-                    SELECT gen_random_uuid()
-                ),
-                $1
-            );
+            INSERT INTO cluster_groups (id, name, tenant_id)
+            VALUES (gen_random_uuid(), $1, $2);
         "#,
     )
     .bind(cluster_group.name)
-    .execute(&state.pool)
+    .bind(tenant_id)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "add_cluster_groups"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "add_cluster_groups_commit"))?;
 
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
@@ -1683,8 +2059,19 @@ pub async fn add_cluster_groups(
 )]
 pub async fn delete_cluster_group(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_cluster_group_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     #[derive(sqlx::FromRow)]
     struct Cluster {
         id: Uuid,
@@ -1703,15 +2090,19 @@ pub async fn delete_cluster_group(
     "#,
     )
     .bind(id)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_cluster_group_fetch_clusters"))?;
 
     sqlx::query("DELETE FROM cluster_groups WHERE id = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "delete_cluster_group_delete"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_cluster_group_commit"))?;
 
     tokio::time::sleep(std::time::Duration::from_millis(
         state.read_replica_wait_in_ms,
@@ -1742,15 +2133,19 @@ pub async fn delete_cluster_group(
 )]
 pub async fn get_cluster_group(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ClusterGroupData>, (StatusCode, String)> {
-    Ok(Json(
-        sqlx::query_as("SELECT * FROM cluster_groups WHERE id = $1")
-            .bind(id)
-            .fetch_one(&state.readonly_pool)
-            .await
-            .map_err(|e| sanitize_db_error(e, "get_cluster_group"))?,
-    ))
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+    let result = sqlx::query_as("SELECT * FROM cluster_groups WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_group"))?;
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_group_commit"))?;
+    Ok(Json(result))
 }
 
 /// Update details of cluster group
@@ -1768,9 +2163,20 @@ pub async fn get_cluster_group(
 )]
 pub async fn put_cluster_group(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PutClusterGroup>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_cluster_group_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
             UPDATE
@@ -1785,7 +2191,7 @@ pub async fn put_cluster_group(
     .bind(id)
     .bind(&data.name)
     .bind(data.priority)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_cluster_group_update"))?;
 
@@ -1807,14 +2213,13 @@ pub async fn put_cluster_group(
     "#,
     )
     .bind(id)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_cluster_group_fetch_clusters"))?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(
-        state.read_replica_wait_in_ms,
-    ))
-    .await;
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_cluster_group_commit"))?;
 
     // Parallelize sync operations for all clusters
     let sync_futures = clusters
@@ -1844,20 +2249,76 @@ pub async fn put_cluster_group(
 )]
 pub async fn get_resource_diffs_for_release(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((release_id, diff_generation)): Path<(Uuid, i32)>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<DiffDataWithBody>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    let diff_data_without_body =
-        list_resource_diffs(&state.readonly_pool, release_id, diff_generation)
-            .await
-            .map_err(|e| {
-                tracing::error!("get_resource_diffs_for_release error: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to fetch resource diffs".to_string(),
-                )
-            })?;
+
+    // Query resource diffs within the tenant transaction
+    let diff_data_without_body: Vec<DiffData> = if diff_generation == -1 {
+        sqlx::query_as::<_, DiffData>(
+            r#"
+        SELECT
+            resource_diffs.key,
+            resource_diffs.release_id,
+            resource_diffs.diff_generation,
+            resource_diffs.change_order,
+            resource_diffs.storage_url
+        FROM
+            resource_diffs
+        WHERE
+            resource_diffs.release_id = $1
+            AND resource_diffs.diff_generation = (
+                SELECT diff_generation FROM releases WHERE id = $1
+            )
+        LIMIT 100
+        "#,
+        )
+        .bind(release_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("get_resource_diffs_for_release error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to fetch resource diffs".to_string(),
+            )
+        })?
+    } else {
+        sqlx::query_as::<_, DiffData>(
+            r#"
+        SELECT
+            resource_diffs.key,
+            resource_diffs.release_id,
+            resource_diffs.diff_generation,
+            resource_diffs.change_order,
+            resource_diffs.storage_url
+        FROM
+            resource_diffs
+        WHERE
+            resource_diffs.release_id = $1
+            AND resource_diffs.diff_generation = $2
+        LIMIT 100
+        "#,
+        )
+        .bind(release_id)
+        .bind(diff_generation)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("get_resource_diffs_for_release error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to fetch resource diffs".to_string(),
+            )
+        })?
+    };
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_resource_diffs_for_release_commit"))?;
 
     // Apply pagination to results
     let paginated_diffs: Vec<_> = diff_data_without_body
@@ -1925,8 +2386,19 @@ pub async fn get_resource_diffs_for_release(
 )]
 pub async fn put_release_selection(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_release_selection_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
         UPDATE releases
@@ -1952,7 +2424,7 @@ pub async fn put_release_selection(
     "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_release_manual_selection_update1"))?;
 
@@ -1971,7 +2443,7 @@ pub async fn put_release_selection(
     "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_release_manual_selection_update2"))?;
 
@@ -1992,9 +2464,13 @@ pub async fn put_release_selection(
     "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_release_manual_selection_update3"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_release_selection_commit"))?;
 
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
@@ -2016,8 +2492,19 @@ pub async fn put_release_selection(
 )]
 pub async fn put_select_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(service_version_id): Path<Uuid>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_select_service_version_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Get the service version details
     let sv = sqlx::query_as::<_, (Uuid, Uuid, String, String, String)>(
         r#"
@@ -2032,7 +2519,7 @@ pub async fn put_select_service_version(
         "#,
     )
     .bind(service_version_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_select_service_version"))?
     .ok_or_else(|| {
@@ -2049,7 +2536,7 @@ pub async fn put_select_service_version(
         r#"SELECT repo_branch_id, name FROM service_definitions WHERE id = $1"#,
     )
     .bind(service_def_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_select_service_version"))?;
 
@@ -2062,7 +2549,7 @@ pub async fn put_select_service_version(
     )
     .bind(namespace_id)
     .bind(service_version_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_select_service_version"))?;
 
@@ -2085,7 +2572,7 @@ pub async fn put_select_service_version(
         .bind(namespace_id)
         .bind(&name)
         .bind(existing_release_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_select_service_version"))?;
     } else {
@@ -2102,7 +2589,7 @@ pub async fn put_select_service_version(
         )
         .bind(namespace_id)
         .bind(&name)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_select_service_version"))?;
 
@@ -2110,8 +2597,8 @@ pub async fn put_select_service_version(
         sqlx::query(
             r#"
             INSERT INTO releases 
-            (id, service_id, namespace_id, name, version, git_sha, path, repo_branch_id, hash, manually_selected_at)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $4, NOW())
+            (id, service_id, namespace_id, name, version, git_sha, path, repo_branch_id, hash, manually_selected_at, tenant_id)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $4, NOW(), $8)
             "#,
         )
         .bind(service_version_id)
@@ -2121,10 +2608,15 @@ pub async fn put_select_service_version(
         .bind(&git_sha)
         .bind(&path)
         .bind(repo_branch_id)
-        .execute(&state.pool)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_select_service_version"))?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_select_service_version_commit"))?;
 
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
@@ -2148,8 +2640,19 @@ pub async fn put_select_service_version(
 )]
 pub async fn put_restore_latest_release(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((id, release_name)): Path<(Uuid, String)>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_restore_latest_release_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     match sqlx::query(
         r#"
         UPDATE releases
@@ -2164,7 +2667,7 @@ pub async fn put_restore_latest_release(
     )
     .bind(id)
     .bind(&release_name)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     {
         Ok(pg_query_result) => {
@@ -2198,7 +2701,7 @@ pub async fn put_restore_latest_release(
     )
     .bind(id)
     .bind(&release_name)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(row) => row.path,
@@ -2229,7 +2732,7 @@ pub async fn put_restore_latest_release(
     )
     .bind(id)
     .bind(&release_name)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await{
         Ok(row) => row.repo_branch_id,
         Err(e) => { return Err(sanitize_db_error(e, "put_restore_latest_release_find_repo_branch"));}
@@ -2247,7 +2750,8 @@ pub async fn put_restore_latest_release(
             repo_branch_id,
             version,
             git_sha,
-            hash
+            hash,
+            tenant_id
         )
         VALUES
         (
@@ -2259,16 +2763,22 @@ pub async fn put_restore_latest_release(
             $4,
             '-',
             '',
-            ''
+            '',
+            $5
         )"#,
     )
     .bind(id)
     .bind(&path)
     .bind(&release_name)
     .bind(repo_branch_id)
-    .execute(&state.pool)
+    .bind(tenant_id)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_restore_latest_release_insert"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_restore_latest_release_commit"))?;
 
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
@@ -2292,9 +2802,11 @@ pub async fn put_restore_latest_release(
 )]
 pub async fn get_release_status(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(cluster_id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ReleaseStatus>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let result = sqlx::query_as::<_, ReleaseData>(
         r#"
@@ -2345,7 +2857,7 @@ pub async fn get_release_status(
     .bind(cluster_id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_cluster_releases_via_id"))?
     .into_iter()
@@ -2357,6 +2869,9 @@ pub async fn get_release_status(
     })
     .collect::<Vec<_>>();
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_release_status_commit"))?;
     Ok(Json(result))
 }
 
@@ -2379,9 +2894,11 @@ pub async fn get_release_status(
 )]
 pub async fn get_namespace_releases(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((id, release_name)): Path<(Uuid, String)>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ReleaseData>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let mut releases = sqlx::query_as::<_, ReleaseData>(
         r#"
@@ -2439,9 +2956,13 @@ pub async fn get_namespace_releases(
     .bind(&release_name)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_namespace_releases"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_namespace_releases_commit"))?;
 
     // Compute paths from templates
     for release in &mut releases {
@@ -2474,10 +2995,12 @@ pub async fn get_namespace_releases(
 )]
 pub async fn get_release_service_versions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((namespace_id, release_name)): Path<(Uuid, String)>,
     Query(pagination): Query<Pagination>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<PaginatedResponse<ServiceVersionForRelease>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let deployed_only = params
         .get("deployed_only")
@@ -2496,7 +3019,7 @@ pub async fn get_release_service_versions(
     )
     .bind(namespace_id)
     .bind(&release_name)
-    .fetch_optional(&state.readonly_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_release_service_versions"))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Release not found".to_string()))?;
@@ -2511,7 +3034,7 @@ pub async fn get_release_service_versions(
     )
     .bind(namespace_id)
     .bind(&release_name)
-    .fetch_optional(&state.readonly_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_release_service_versions"))?
     .flatten();
@@ -2542,7 +3065,7 @@ pub async fn get_release_service_versions(
     let total = sqlx::query_scalar::<_, i64>(&count_str)
         .bind(service_def_id)
         .bind(namespace_id)
-        .fetch_one(&state.readonly_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_release_service_versions"))?;
 
@@ -2585,9 +3108,13 @@ pub async fn get_release_service_versions(
         .bind(pagination.limit)
         .bind(current_service_id)
         .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_release_service_versions"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_release_service_versions_commit"))?;
 
     Ok(Json(PaginatedResponse::new(
         versions,
@@ -2612,8 +3139,10 @@ pub async fn get_release_service_versions(
 )]
 pub async fn get_namespace_release_info(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((id, release_name)): Path<(Uuid, String)>,
 ) -> Result<Json<ReleaseStatus>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let mut result = sqlx::query_as::<_, ReleaseData>(
         r#"
         SELECT
@@ -2655,9 +3184,13 @@ pub async fn get_namespace_release_info(
     )
     .bind(id)
     .bind(&release_name)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_namespace_release_info"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_namespace_release_info_commit"))?;
 
     // Compute path from template
     compute_release_path(&mut result);
@@ -2685,11 +3218,12 @@ pub async fn get_namespace_release_info(
 )]
 pub async fn get_hive_agent_errors(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(cluster_id): Path<Uuid>,
 ) -> Result<Json<Vec<HiveError>>, (StatusCode, String)> {
-    Ok(Json(
-        sqlx::query_as::<_, HiveError>(
-            r#"
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+    let result = sqlx::query_as::<_, HiveError>(
+        r#"
             SELECT
                 message,
                 updated_at
@@ -2700,12 +3234,15 @@ pub async fn get_hive_agent_errors(
                 AND deprecated_at IS NULL
             ORDER BY updated_at DESC LIMIT 10
         "#,
-        )
-        .bind(cluster_id)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(cluster_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_hive_agent_errors"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_hive_agent_errors"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_hive_agent_errors_commit"))?;
+    Ok(Json(result))
 }
 
 /// Gets the last heartbeat information for an agent given the cluster id
@@ -2723,11 +3260,12 @@ pub async fn get_hive_agent_errors(
 )]
 pub async fn get_hive_agent_heartbeat(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(cluster_id): Path<Uuid>,
 ) -> Result<Json<Heartbeat>, (StatusCode, String)> {
-    Ok(Json(
-        sqlx::query_as::<_, Heartbeat>(
-            r#"
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+    let result = sqlx::query_as::<_, Heartbeat>(
+        r#"
             SELECT
                 last_check_in_at,
                 deleted_at
@@ -2736,12 +3274,15 @@ pub async fn get_hive_agent_heartbeat(
             WHERE
                 id = $1
         "#,
-        )
-        .bind(cluster_id)
-        .fetch_one(&state.readonly_pool)
+    )
+    .bind(cluster_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_heartbeat"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_heartbeat"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_hive_agent_heartbeat_commit"))?;
+    Ok(Json(result))
 }
 
 /// Gets a list of pending all pending releases
@@ -2759,10 +3300,11 @@ pub async fn get_hive_agent_heartbeat(
 )]
 pub async fn get_pending_releases(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<PendingReleases>>, (StatusCode, String)> {
-    Ok(Json(
-        sqlx::query_as::<_, PendingReleases>(
-            r#"
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+    let result = sqlx::query_as::<_, PendingReleases>(
+        r#"
                 SELECT
                     clusters.id AS cluster_id,
                     STRING_AGG(releases.name, ', ') AS release_names,
@@ -2777,11 +3319,14 @@ pub async fn get_pending_releases(
                 WHERE clusters.deleted_at IS NULL
                 GROUP BY clusters.id
             "#,
-        )
-        .fetch_all(&state.readonly_pool)
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_pending_releases_without_pagination"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_pending_releases_without_pagination"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_pending_releases_commit"))?;
+    Ok(Json(result))
 }
 
 /// Gets a list of the latest errors produced by a specific release
@@ -2803,13 +3348,14 @@ pub async fn get_pending_releases(
 )]
 pub async fn get_release_errors(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(cluster_id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<HiveError>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, HiveError>(
-            r#"
+    let result = sqlx::query_as::<_, HiveError>(
+        r#"
             SELECT
                 message,
                 updated_at
@@ -2821,14 +3367,17 @@ pub async fn get_release_errors(
             ORDER BY updated_at DESC
             LIMIT $2 OFFSET $3
         "#,
-        )
-        .bind(cluster_id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(cluster_id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_release_errors"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_release_errors"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_release_errors_commit"))?;
+    Ok(Json(result))
 }
 
 /// Update a list of releases for approval
@@ -2847,6 +3396,7 @@ pub async fn get_release_errors(
 )]
 pub async fn put_approvals(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<PutApprovals>,
 ) -> Result<Json<Vec<ReleaseCandidate>>, (StatusCode, String)> {
     if is_empty_or_has_empty_string(&data.ids) {
@@ -2855,6 +3405,16 @@ pub async fn put_approvals(
             "No releases subbmited for approval".to_string(),
         ))
     } else {
+        let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|e| sanitize_db_error(e, "put_approvals_begin"))?;
+
+        set_tenant_context(&mut tx, tenant_id).await?;
+
         sqlx::query(
             r#"
             UPDATE releases
@@ -2867,7 +3427,7 @@ pub async fn put_approvals(
         "#,
         )
         .bind(&data.ids)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_approvals_update"))?;
 
@@ -2884,6 +3444,10 @@ pub async fn put_approvals(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        tx.commit()
+            .await
+            .map_err(|e| sanitize_db_error(e, "put_approvals_commit"))?;
 
         // Batch fetch all release candidates at once instead of N queries
         let all_release_candidates =
@@ -2917,6 +3481,7 @@ pub async fn put_approvals(
 )]
 pub async fn put_unapprovals(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<PutApprovals>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     if is_empty_or_has_empty_string(&data.ids) {
@@ -2925,6 +3490,16 @@ pub async fn put_unapprovals(
             "No releases subbmited for unapproval".to_string(),
         ))
     } else {
+        let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|e| sanitize_db_error(e, "put_unapprovals_begin"))?;
+
+        set_tenant_context(&mut tx, tenant_id).await?;
+
         sqlx::query(
             r#"
             UPDATE releases
@@ -2938,9 +3513,13 @@ pub async fn put_unapprovals(
         "#,
         )
         .bind(&data.ids)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_unapprovals"))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| sanitize_db_error(e, "put_unapprovals_commit"))?;
 
         Ok((StatusCode::NO_CONTENT, String::new()))
     }
@@ -2965,9 +3544,11 @@ pub async fn put_unapprovals(
 )]
 pub async fn get_cluster_group_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ClusterGroupServices>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let result = sqlx::query_as(
         r#"
@@ -3001,10 +3582,13 @@ pub async fn get_cluster_group_service_definitions(
     .bind(id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_cluster_group_service_definitions"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_cluster_group_service_definitions_commit"))?;
     Ok(Json(result))
 }
 
@@ -3024,21 +3608,27 @@ pub async fn get_cluster_group_service_definitions(
 )]
 pub async fn delete_service_definition_relationship(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((cluster_group_id, service_definition_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_definition_relationship_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         "DELETE FROM service_definition_cluster_group_relationships WHERE cluster_group_id = $1 AND service_definition_id = $2",
     )
     .bind(cluster_group_id)
     .bind(service_definition_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_service_definition_relationship"))?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(
-        state.read_replica_wait_in_ms,
-    ))
-    .await;
 
     #[derive(sqlx::FromRow)]
     struct Cluster {
@@ -3058,9 +3648,13 @@ pub async fn delete_service_definition_relationship(
     "#,
     )
     .bind(cluster_group_id)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_fetch_clusters"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_definition_relationship_commit"))?;
 
     // Parallelize sync operations for all clusters
     let sync_futures = clusters
@@ -3087,8 +3681,19 @@ pub async fn delete_service_definition_relationship(
 )]
 pub async fn delete_service_from_namespace(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path((namespace_id, service_name)): Path<(String, String)>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_from_namespace_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
         UPDATE
@@ -3103,9 +3708,14 @@ pub async fn delete_service_from_namespace(
     )
     .bind(namespace_id)
     .bind(service_name)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_service_from_namespace"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_from_namespace_commit"))?;
+
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
 
@@ -3128,13 +3738,14 @@ pub async fn delete_service_from_namespace(
 )]
 pub async fn get_cluster_group_cluster_association(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ClusterGroupClusterAssociation>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as(
-            r#"
+    let result = sqlx::query_as(
+        r#"
         SELECT
             clusters.*,
             CASE
@@ -3160,26 +3771,30 @@ pub async fn get_cluster_group_cluster_association(
         ORDER BY clusters.name
         LIMIT $2 OFFSET $3
         "#,
-        )
-        .bind(id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_cluster_group_cluster_association"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_cluster_group_cluster_association"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_cluster_group_cluster_association_commit"))?;
+    Ok(Json(result))
 }
 
 fn generate_jwt(
     jwt_secret_bytes: &[u8],
     email: String,
+    tenant_id: String,
     roles: Vec<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Token expiration set to 2 hours for security
     // NOTE: Database has refresh_tokens table (see migrations/20241216000001_add_refresh_tokens.sql)
     // TODO: Implement refresh token flow to allow token renewal without re-authentication
     let expiration = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(now) => now + Duration::from_secs(2 * 60 * 60), // 2 hours (reduced from 12 for security)
+        Ok(now) => now + Duration::from_secs(2 * 60 * 60), // 2 hours
         Err(e) => {
             let message = format!("Error generating JWT expiration date: {:?}", e);
             error!("{}", message);
@@ -3189,6 +3804,7 @@ fn generate_jwt(
 
     let claims = Claim {
         email,
+        tenant_id,
         exp: expiration.as_secs() as usize,
         roles,
     };
@@ -3286,6 +3902,15 @@ async fn validate_auth_with_roles(
             .map_err(|_| StatusCode::UNAUTHORIZED)?
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
+        // Enforce that the session tenant matches the domain being used
+        let request_tenant_id = extract_tenant_from_request(&state.pool, req.headers())
+            .await
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let user_tenant_id = user.tenant_id.ok_or(StatusCode::UNAUTHORIZED)?;
+        if user_tenant_id != request_tenant_id {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+
         if let Some(required) = required_roles {
             let has_required_role = user
                 .roles
@@ -3330,11 +3955,58 @@ pub struct UiAuthMeResponse {
     pub id: Uuid,
     pub username: String,
     pub roles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UiAuthBootstrapStatusResponse {
     pub bootstrap_required: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TenantRegisterRequest {
+    #[serde(alias = "email")]
+    pub username: String,
+    pub password: String,
+    pub tenant_name: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TenantRegisterResponse {
+    pub tenant_id: Uuid,
+    pub domain: String,
+    pub user_id: Uuid,
+    pub email: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TenantData {
+    pub id: Uuid,
+    pub domain: String,
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateSecretRequest {
+    pub purpose: String,
+    pub plaintext: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SecretMetadata {
+    pub id: Uuid,
+    pub purpose: String,
+    pub created_at: String,
+    pub key_version: i16,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SecretListResponse {
+    pub secrets: Vec<SecretMetadata>,
 }
 
 fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
@@ -3356,18 +4028,28 @@ fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-fn build_session_cookie_value(token: &str, max_age_seconds: i64, secure: bool) -> String {
+fn build_session_cookie_value(
+    token: &str,
+    max_age_seconds: i64,
+    secure: bool,
+    domain: Option<&str>,
+) -> String {
     // SameSite Strict since you said same-site and no CORS.
     // Secure is optional for local http dev.
+    let domain_attr = domain
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("; Domain={}", d))
+        .unwrap_or_default();
+
     if secure {
         format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}; Secure",
-            UI_SESSION_COOKIE_NAME, token, max_age_seconds
+            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}; Secure{}",
+            UI_SESSION_COOKIE_NAME, token, max_age_seconds, domain_attr
         )
     } else {
         format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            UI_SESSION_COOKIE_NAME, token, max_age_seconds
+            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+            UI_SESSION_COOKIE_NAME, token, max_age_seconds, domain_attr
         )
     }
 }
@@ -3411,43 +4093,25 @@ async fn lookup_ui_session(
     session_token: &str,
 ) -> Result<Option<UiAuthMeResponse>, sqlx::Error> {
     let token_hash = util::hash_string(session_token);
-    let row = sqlx::query_as::<_, (Uuid, String, Vec<String>)>(
+
+    // Use SECURITY DEFINER function to bypass RLS for session lookup
+    let row = sqlx::query_as::<_, (Uuid, String, Vec<String>, Option<Uuid>, Option<String>)>(
         r#"
-        SELECT
-            u.id,
-            u.username,
-            u.roles
-        FROM
-            ui_sessions s
-            JOIN ui_users u ON u.id = s.user_id
-        WHERE
-            s.token_hash = $1
-            AND s.revoked_at IS NULL
-            AND s.expires_at > NOW()
-            AND u.deleted_at IS NULL
+        SELECT user_id, username, roles, tenant_id, tenant_name
+        FROM auth_lookup_ui_session($1)
         "#,
     )
-    .bind(token_hash)
+    .bind(&token_hash)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, username, roles)) = row {
-        // Best-effort touch. Don't fail auth if this update fails.
-        let _ = sqlx::query(
-            r#"
-            UPDATE ui_sessions
-            SET last_seen_at = NOW()
-            WHERE token_hash = $1
-            "#,
-        )
-        .bind(util::hash_string(session_token))
-        .execute(pool)
-        .await;
-
+    if let Some((id, username, roles, tenant_id, tenant_name)) = row {
         Ok(Some(UiAuthMeResponse {
             id,
             username,
             roles,
+            tenant_id,
+            tenant_name,
         }))
     } else {
         Ok(None)
@@ -3515,17 +4179,53 @@ pub async fn ui_auth_bootstrap(
 
     let roles: Vec<String> = vec!["admin".to_string()];
 
-    let created = sqlx::query_as::<_, (Uuid,)>(
+    // Start a transaction for creating tenant, user, and session
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "ui_auth_bootstrap_begin"))?;
+
+    // Create a bootstrap tenant (domain based on username or default)
+    let tenant_domain = format!(
+        "bootstrap-{}",
+        username
+            .split('@')
+            .next()
+            .unwrap_or("admin")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .take(20)
+            .collect::<String>()
+    );
+    let tenant_id: Uuid = sqlx::query_scalar(
         r#"
-        INSERT INTO ui_users (id, username, password_hash, roles)
-        VALUES (gen_random_uuid(), $1, $2, $3)
+        INSERT INTO tenants (id, domain, name, status, config)
+        VALUES (gen_random_uuid(), $1, 'Bootstrap Tenant', 'active', '{}')
         RETURNING id
         "#,
     )
+    .bind(&tenant_domain)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "ui_auth_bootstrap_tenant"))?;
+
+    // Set tenant context for RLS
+    set_tenant_context(&mut tx, tenant_id).await?;
+
+    // Create the first admin user
+    let created = sqlx::query_as::<_, (Uuid,)>(
+        r#"
+        INSERT INTO ui_users (id, tenant_id, username, password_hash, roles)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4)
+        RETURNING id
+        "#,
+    )
+    .bind(tenant_id)
     .bind(username)
     .bind(password_hash)
     .bind(&roles)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "ui_auth_bootstrap_insert"))?;
 
@@ -3539,20 +4239,21 @@ pub async fn ui_auth_bootstrap(
     })?;
     let session_hash = util::hash_string(&session_token);
 
-    sqlx::query(
-        r#"
-        INSERT INTO ui_sessions (id, user_id, token_hash, expires_at)
-        VALUES (gen_random_uuid(), $1, $2, $3)
-        "#,
-    )
-    .bind(created.0)
-    .bind(session_hash)
-    .bind(expires_at)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| sanitize_db_error(e, "ui_auth_bootstrap_session_insert"))?;
+    // Use SECURITY DEFINER function to bypass RLS (no tenant context yet)
+    sqlx::query("SELECT auth_create_ui_session($1, $2, $3, $4)")
+        .bind(&session_hash)
+        .bind(created.0)
+        .bind(tenant_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "ui_auth_bootstrap_session_insert"))?;
 
-    let cookie = build_session_cookie_value(&session_token, ttl_seconds, ui_cookie_secure());
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "ui_auth_bootstrap_commit"))?;
+
+    let cookie = build_session_cookie_value(&session_token, ttl_seconds, ui_cookie_secure(), None);
     let header = (
         axum::http::header::SET_COOKIE,
         axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
@@ -3570,6 +4271,8 @@ pub async fn ui_auth_bootstrap(
             id: created.0,
             username: username.to_string(),
             roles,
+            tenant_id: None,
+            tenant_name: None,
         }),
     ))
 }
@@ -3614,6 +4317,7 @@ pub async fn ui_auth_bootstrap_status(
 )]
 pub async fn ui_auth_login(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<UiAuthLoginRequest>,
 ) -> Result<
     (
@@ -3632,24 +4336,50 @@ pub async fn ui_auth_login(
         ));
     }
 
-    let row = sqlx::query_as::<_, (Uuid, String, String, Vec<String>)>(
+    // Extract tenant from request first
+    // This ensures we look up the user within the correct tenant
+    let request_tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    // Use transaction with tenant context for RLS
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "ui_auth_login_begin"))?;
+    set_tenant_context(&mut tx, request_tenant_id).await?;
+
+    // Query user by username AND tenant_id
+    // This prevents returning the wrong user when same username exists in multiple tenants
+    let row = sqlx::query_as::<_, (Uuid, String, String, Vec<String>, Uuid)>(
         r#"
-        SELECT id, username, password_hash, roles
+        SELECT id, username, password_hash, roles, tenant_id
         FROM ui_users
-        WHERE deleted_at IS NULL AND username = $1
+        WHERE deleted_at IS NULL AND username = $1 AND tenant_id = $2
         "#,
     )
     .bind(username)
-    .fetch_optional(&state.pool)
+    .bind(request_tenant_id)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "ui_auth_login_select"))?;
 
-    let Some((user_id, username_db, password_hash, roles)) = row else {
+    let Some((user_id, username_db, password_hash, roles, tenant_id)) = row else {
         return Err((
             StatusCode::UNAUTHORIZED,
             String::from("Invalid username or password"),
         ));
     };
+
+    // Fetch tenant name for response (tenants table has permissive RLS)
+    let tenant_name: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT name FROM tenants WHERE id = $1
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "ui_auth_login_tenant_select"))?;
 
     let ok = bcrypt::verify(password.trim(), &password_hash).unwrap_or(false);
     if !ok {
@@ -3669,20 +4399,21 @@ pub async fn ui_auth_login(
     })?;
     let session_hash = util::hash_string(&session_token);
 
-    sqlx::query(
-        r#"
-        INSERT INTO ui_sessions (id, user_id, token_hash, expires_at)
-        VALUES (gen_random_uuid(), $1, $2, $3)
-        "#,
-    )
-    .bind(user_id)
-    .bind(session_hash)
-    .bind(expires_at)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| sanitize_db_error(e, "ui_auth_login_session_insert"))?;
+    // Use SECURITY DEFINER function to bypass RLS (no tenant context yet)
+    sqlx::query("SELECT auth_create_ui_session($1, $2, $3, $4)")
+        .bind(&session_hash)
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "ui_auth_login_session_insert"))?;
 
-    let cookie = build_session_cookie_value(&session_token, ttl_seconds, ui_cookie_secure());
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "ui_auth_login_commit"))?;
+
+    let cookie = build_session_cookie_value(&session_token, ttl_seconds, ui_cookie_secure(), None);
     let header = (
         axum::http::header::SET_COOKIE,
         axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
@@ -3700,6 +4431,8 @@ pub async fn ui_auth_login(
             id: user_id,
             username: username_db,
             roles,
+            tenant_id: Some(tenant_id),
+            tenant_name,
         }),
     ))
 }
@@ -3728,16 +4461,11 @@ pub async fn ui_auth_logout(
 > {
     if let Some(token) = cookie_value(req.headers(), UI_SESSION_COOKIE_NAME) {
         let token_hash = util::hash_string(&token);
-        let _ = sqlx::query(
-            r#"
-            UPDATE ui_sessions
-            SET revoked_at = NOW()
-            WHERE token_hash = $1 AND revoked_at IS NULL
-            "#,
-        )
-        .bind(token_hash)
-        .execute(&state.pool)
-        .await;
+        // Use SECURITY DEFINER function to bypass RLS
+        let _ = sqlx::query("SELECT auth_revoke_ui_session($1)")
+            .bind(&token_hash)
+            .execute(&state.pool)
+            .await;
     }
 
     let cookie = build_clear_session_cookie_value(ui_cookie_secure());
@@ -3781,6 +4509,713 @@ pub async fn ui_auth_me(
     Ok(Json(user))
 }
 
+/// Generate a domain slug from tenant name.
+/// Rules:
+/// - Only lowercase ASCII letters (a-z), digits (0-9), and hyphens (-) allowed
+/// - No leading or trailing hyphens
+/// - No consecutive hyphens
+/// - Non-alphanumeric characters become hyphens (collapsed)
+/// - Maximum 63 characters (DNS subdomain limit)
+/// - Empty result if no valid characters
+fn generate_domain_slug(name: &str) -> String {
+    let mut result = String::new();
+    let mut last_was_hyphen = true; // Treat start as hyphen to prevent leading hyphen
+
+    for c in name.chars() {
+        if result.len() >= 63 {
+            break;
+        }
+
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            result.push(c);
+            last_was_hyphen = false;
+        } else if c.is_ascii_uppercase() {
+            result.push(c.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            // Any non-alphanumeric character becomes a hyphen
+            result.push('-');
+            last_was_hyphen = true;
+        }
+        // Skip consecutive non-alphanumeric characters
+    }
+
+    // Remove trailing hyphen if present
+    while result.ends_with('-') {
+        result.pop();
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod slug_tests {
+    use super::generate_domain_slug;
+
+    #[test]
+    fn test_simple_lowercase() {
+        assert_eq!(generate_domain_slug("acme"), "acme");
+    }
+
+    #[test]
+    fn test_uppercase_to_lowercase() {
+        assert_eq!(generate_domain_slug("ACME"), "acme");
+        assert_eq!(generate_domain_slug("AcMe"), "acme");
+    }
+
+    #[test]
+    fn test_spaces_become_hyphens() {
+        assert_eq!(generate_domain_slug("acme corp"), "acme-corp");
+        assert_eq!(generate_domain_slug("my company name"), "my-company-name");
+    }
+
+    #[test]
+    fn test_underscores_become_hyphens() {
+        assert_eq!(generate_domain_slug("acme_corp"), "acme-corp");
+    }
+
+    #[test]
+    fn test_no_double_hyphens() {
+        assert_eq!(generate_domain_slug("acme--corp"), "acme-corp");
+        assert_eq!(generate_domain_slug("acme---corp"), "acme-corp");
+        assert_eq!(generate_domain_slug("acme - corp"), "acme-corp");
+        assert_eq!(generate_domain_slug("acme  corp"), "acme-corp");
+    }
+
+    #[test]
+    fn test_no_leading_hyphen() {
+        assert_eq!(generate_domain_slug("-acme"), "acme");
+        assert_eq!(generate_domain_slug("--acme"), "acme");
+        assert_eq!(generate_domain_slug(" acme"), "acme");
+    }
+
+    #[test]
+    fn test_no_trailing_hyphen() {
+        assert_eq!(generate_domain_slug("acme-"), "acme");
+        assert_eq!(generate_domain_slug("acme--"), "acme");
+        assert_eq!(generate_domain_slug("acme "), "acme");
+    }
+
+    #[test]
+    fn test_numbers_allowed() {
+        assert_eq!(generate_domain_slug("acme123"), "acme123");
+        assert_eq!(generate_domain_slug("123acme"), "123acme");
+        assert_eq!(generate_domain_slug("acme-123-corp"), "acme-123-corp");
+    }
+
+    #[test]
+    fn test_special_chars_become_hyphens() {
+        assert_eq!(generate_domain_slug("acme!@#$%corp"), "acme-corp");
+        assert_eq!(generate_domain_slug("acme.corp"), "acme-corp");
+        assert_eq!(generate_domain_slug("acme&corp"), "acme-corp");
+    }
+
+    #[test]
+    fn test_unicode_becomes_hyphens() {
+        assert_eq!(generate_domain_slug("acme\u{00e9}corp"), "acme-corp"); // e with accent
+        assert_eq!(generate_domain_slug("acme\u{4e2d}corp"), "acme-corp"); // Chinese char
+        assert_eq!(generate_domain_slug("\u{00fc}ber"), "ber"); // u with umlaut at start
+    }
+
+    #[test]
+    fn test_empty_input() {
+        assert_eq!(generate_domain_slug(""), "");
+    }
+
+    #[test]
+    fn test_only_invalid_chars() {
+        assert_eq!(generate_domain_slug("!@#$%^"), "");
+        assert_eq!(generate_domain_slug("---"), "");
+        assert_eq!(generate_domain_slug("   "), "");
+    }
+
+    #[test]
+    fn test_mixed_valid_invalid() {
+        assert_eq!(generate_domain_slug("  --acme--  "), "acme");
+        assert_eq!(generate_domain_slug("!!!acme!!!"), "acme");
+    }
+
+    #[test]
+    fn test_realistic_company_names() {
+        assert_eq!(generate_domain_slug("Acme Corporation"), "acme-corporation");
+        assert_eq!(generate_domain_slug("Smith & Sons Ltd."), "smith-sons-ltd");
+        assert_eq!(generate_domain_slug("O'Reilly Media"), "o-reilly-media");
+        assert_eq!(generate_domain_slug("AT&T"), "at-t");
+        assert_eq!(generate_domain_slug("3M Company"), "3m-company");
+    }
+
+    #[test]
+    fn test_max_length_63_chars() {
+        // Exactly 63 chars should be preserved
+        let input_63 = "a".repeat(63);
+        assert_eq!(generate_domain_slug(&input_63).len(), 63);
+
+        // 64+ chars should be truncated to 63
+        let input_100 = "a".repeat(100);
+        assert_eq!(generate_domain_slug(&input_100).len(), 63);
+
+        // Long name with spaces should truncate correctly
+        let long_name =
+            "this is an extremely long company name that exceeds the dns subdomain limit";
+        let slug = generate_domain_slug(long_name);
+        assert!(slug.len() <= 63);
+        assert!(!slug.ends_with('-'));
+        assert!(!slug.starts_with('-'));
+    }
+
+    #[test]
+    fn test_truncation_removes_trailing_hyphen() {
+        // If truncation lands on a hyphen, it should be removed
+        // "abcdefghij" repeated 6 times = 60 chars, then " xy" would add "-xy" making 63
+        // but if we have 62 chars + space, truncation at 63 would leave trailing hyphen
+        let input = "a".repeat(62) + " xyz";
+        let slug = generate_domain_slug(&input);
+        assert!(slug.len() <= 63);
+        assert!(!slug.ends_with('-'));
+    }
+}
+
+/// Register a new tenant and create first admin user
+#[utoipa::path(
+    post,
+    path = "/api/tenants/register",
+    request_body = TenantRegisterRequest,
+    responses(
+        (status = 201, description = "Tenant and user created successfully", body = TenantRegisterResponse),
+        (status = 400, description = "Invalid request data"),
+        (status = 409, description = "Email or domain already exists"),
+        (status = 500, description = "Database or server error"),
+    )
+)]
+pub async fn register_tenant(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+    Json(data): Json<TenantRegisterRequest>,
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::HeaderName, axum::http::HeaderValue); 1],
+        Json<TenantRegisterResponse>,
+    ),
+    (StatusCode, String),
+> {
+    let email = data.username.trim().to_lowercase();
+    let password = data.password.trim();
+    let tenant_name = data.tenant_name.trim();
+
+    // Validation
+    if email.is_empty() || !email.contains('@') {
+        return Err((StatusCode::BAD_REQUEST, "Invalid email".to_string()));
+    }
+    if password.len() < 8 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+    if tenant_name.is_empty() || tenant_name.len() > 255 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Tenant name must be between 1 and 255 characters".to_string(),
+        ));
+    }
+
+    // Generate domain slug from tenant name
+    let domain_slug = generate_domain_slug(tenant_name);
+    if domain_slug.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Tenant name must contain alphanumeric characters".to_string(),
+        ));
+    }
+
+    // Store just the slug in domain column (e.g., 'acme' not 'acme.beecd.local')
+    // This prevents collisions and works with any host variant
+    let domain = domain_slug.clone();
+
+    let password_hash = util::bcrypt_string(password).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to hash password".to_string(),
+        )
+    })?;
+
+    // Start transaction: create tenant, then user
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "register_tenant_begin_tx"))?;
+
+    // Create tenant
+    let tenant_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO tenants (id, domain, name, status, config)
+        VALUES (gen_random_uuid(), $1, $2, 'active', '{}')
+        ON CONFLICT (domain) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(&domain)
+    .bind(tenant_name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "register_tenant_insert_tenant"))?
+    .ok_or_else(|| (StatusCode::CONFLICT, "Domain already exists".to_string()))?;
+
+    tracing::info!("Created tenant with id: {}", tenant_id);
+
+    // Set tenant context for RLS - required before inserting tenant-scoped data
+    set_tenant_context(&mut tx, tenant_id).await?;
+    tracing::info!("Set tenant context for RLS");
+
+    // Create user in the new tenant
+    let user_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO ui_users (id, tenant_id, username, password_hash, roles)
+        VALUES (gen_random_uuid(), $1, $2, $3, ARRAY['admin']::text[])
+        RETURNING id
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to insert user: {:?}", e);
+        // Check for unique constraint violation
+        if let sqlx::Error::Database(ref db_err) = e {
+            if db_err.is_unique_violation() {
+                return (
+                    StatusCode::CONFLICT,
+                    "Email already registered in this tenant".to_string(),
+                );
+            }
+        }
+        sanitize_db_error(e, "register_tenant_insert_user")
+    })?;
+
+    tracing::info!("Created user with id: {}", user_id);
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "register_tenant_commit_tx"))?;
+
+    // Create session for the new user
+    let ttl_seconds = ui_session_ttl_seconds();
+    let expires_at = Utc::now() + chrono::Duration::seconds(ttl_seconds);
+    let session_token = util::generate_secure_token_256().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to generate session token".to_string(),
+        )
+    })?;
+    let session_hash = util::hash_string(&session_token);
+
+    // Use SECURITY DEFINER function to bypass RLS (tenant just created)
+    sqlx::query("SELECT auth_create_ui_session($1, $2, $3, $4)")
+        .bind(&session_hash)
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(expires_at)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| sanitize_db_error(e, "register_tenant_session_insert"))?;
+
+    // Share cookie across subdomains so redirect lands authenticated
+    // Use the Host header to extract the parent domain (not the stored domain which may differ .local vs .localhost)
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
+    let request_domain = host.split(':').next().unwrap_or(host);
+    let cookie_domain = request_domain
+        .split_once('.')
+        .map(|(_, rest)| format!(".{}", rest))
+        .unwrap_or_default();
+
+    let cookie = build_session_cookie_value(
+        &session_token,
+        ttl_seconds,
+        ui_cookie_secure(),
+        if cookie_domain.is_empty() {
+            None
+        } else {
+            Some(&cookie_domain)
+        },
+    );
+    let header = (
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to set session cookie".to_string(),
+            )
+        })?,
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        [header],
+        Json(TenantRegisterResponse {
+            tenant_id,
+            domain,
+            user_id,
+            email,
+        }),
+    ))
+}
+
+/// Store a secret (GitHub token, PGP key, etc.) encrypted in the database
+#[utoipa::path(
+    post,
+    path = "/api/secrets",
+    security(
+        ("bearerAuth"=[]),
+    ),
+    request_body = CreateSecretRequest,
+    responses(
+        (status = 201, description = "Secret created successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Not authenticated"),
+        (status = 409, description = "Secret purpose already exists for this tenant"),
+        (status = 500, description = "Database or encryption error"),
+    )
+)]
+pub async fn create_secret(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+    Json(data): Json<CreateSecretRequest>,
+) -> Result<(StatusCode, Json<SecretMetadata>), (StatusCode, String)> {
+    // Get current user and tenant
+    let Some(token) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(v) = part.strip_prefix(format!("{}=", UI_SESSION_COOKIE_NAME).as_str())
+                {
+                    return Some(v.to_string());
+                }
+            }
+            None
+        })
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "Not authenticated".to_string()));
+    };
+
+    let _user = lookup_ui_session(&state.pool, &token)
+        .await
+        .map_err(|e| sanitize_db_error(e, "create_secret_lookup_user"))?
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Not authenticated".to_string()))?;
+
+    // Get bootstrap key from environment
+    let bootstrap_key_str = std::env::var("HIVE_CRYPTO_ROOT_KEY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Bootstrap key not configured".to_string(),
+        )
+    })?;
+
+    let bootstrap_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&bootstrap_key_str)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid bootstrap key format".to_string(),
+            )
+        })?;
+
+    if bootstrap_key_bytes.len() != 32 {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Bootstrap key must be 32 bytes".to_string(),
+        ));
+    }
+
+    let mut bootstrap_key = [0u8; 32];
+    bootstrap_key.copy_from_slice(&bootstrap_key_bytes);
+
+    // Validate inputs
+    if data.purpose.is_empty() || data.plaintext.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "purpose and plaintext are required".to_string(),
+        ));
+    }
+
+    // Resolve tenant from Host header
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    // Encrypt the secret
+    let (ciphertext, iv) =
+        crypto::encrypt(&bootstrap_key, data.plaintext.as_bytes()).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Encryption failed: {}", e),
+            )
+        })?;
+
+    // Persist to database with upsert
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "create_secret_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
+    let row = sqlx::query_as::<_, (Uuid, chrono::DateTime<Utc>, i16)>(
+        r#"
+        INSERT INTO tenant_secrets (tenant_id, purpose, ciphertext, iv, key_version)
+        VALUES ($1, $2, $3, $4, 1)
+        ON CONFLICT (tenant_id, purpose) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            ciphertext = EXCLUDED.ciphertext,
+            iv = EXCLUDED.iv,
+            updated_at = NOW()
+        RETURNING id, created_at, key_version
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&data.purpose)
+    .bind(&ciphertext)
+    .bind(&iv)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "create_secret_upsert"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "create_secret_commit"))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SecretMetadata {
+            id: row.0,
+            purpose: data.purpose,
+            created_at: row.1.to_rfc3339(),
+            key_version: row.2,
+        }),
+    ))
+}
+
+/// List secrets (metadata only, no plaintext decryption)
+#[utoipa::path(
+    get,
+    path = "/api/secrets",
+    security(
+        ("bearerAuth"=[]),
+    ),
+    responses(
+        (status = 200, description = "List of secrets", body = SecretListResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 500, description = "Database error"),
+    )
+)]
+pub async fn list_secrets(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<SecretListResponse>, (StatusCode, String)> {
+    let Some(_token) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(v) = part.strip_prefix(format!("{}=", UI_SESSION_COOKIE_NAME).as_str())
+                {
+                    return Some(v.to_string());
+                }
+            }
+            None
+        })
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "Not authenticated".to_string()));
+    };
+
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "list_secrets_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
+    let rows = sqlx::query_as::<_, (Uuid, String, chrono::DateTime<Utc>, i16)>(
+        r#"
+        SELECT id, purpose, created_at, key_version
+        FROM tenant_secrets
+        WHERE tenant_id = $1 AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "list_secrets_query"))?;
+
+    let secrets: Vec<SecretMetadata> = rows
+        .into_iter()
+        .map(|(id, purpose, created_at, key_version)| SecretMetadata {
+            id,
+            purpose,
+            created_at: created_at.to_rfc3339(),
+            key_version,
+        })
+        .collect();
+
+    Ok(Json(SecretListResponse { secrets }))
+}
+
+/// Delete a secret (soft delete)
+#[utoipa::path(
+    delete,
+    path = "/api/secrets/{purpose}",
+    security(
+        ("bearerAuth"=[]),
+    ),
+    responses(
+        (status = 204, description = "Secret deleted"),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Secret not found"),
+        (status = 500, description = "Database error"),
+    )
+)]
+pub async fn delete_secret(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(purpose): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(_token) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(v) = part.strip_prefix(format!("{}=", UI_SESSION_COOKIE_NAME).as_str())
+                {
+                    return Some(v.to_string());
+                }
+            }
+            None
+        })
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "Not authenticated".to_string()));
+    };
+
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_secret_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE tenant_secrets
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE tenant_id = $1 AND purpose = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&purpose)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "delete_secret_update"))?;
+
+    if result.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "Secret not found".to_string()));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_secret_commit"))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Retrieve a secret's encrypted ciphertext for agent-side decryption
+/// This endpoint supports the optional Phase 5 agent-side secret passing pattern
+/// The agent can optionally decrypt secrets locally using its own key material
+#[utoipa::path(
+    get,
+    path = "/api/secrets/{purpose}/encrypted",
+    security(
+        ("bearerAuth"=[]),
+    ),
+    responses(
+        (status = 200, description = "Encrypted secret data"),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Secret not found"),
+        (status = 500, description = "Database error"),
+    )
+)]
+pub async fn get_encrypted_secret(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(purpose): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(_token) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(v) = part.strip_prefix(format!("{}=", UI_SESSION_COOKIE_NAME).as_str())
+                {
+                    return Some(v.to_string());
+                }
+            }
+            None
+        })
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "Not authenticated".to_string()));
+    };
+
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_encrypted_secret_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
+    let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i16)>(
+        r#"
+        SELECT ciphertext, iv, key_version
+        FROM tenant_secrets
+        WHERE tenant_id = $1 AND purpose = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&purpose)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_encrypted_secret_query"))?;
+
+    let (ciphertext, iv, key_version) =
+        row.ok_or_else(|| (StatusCode::NOT_FOUND, "Secret not found".to_string()))?;
+
+    // Return encrypted data as base64 for safe transport
+    let result = json!({
+        "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+        "iv": base64::engine::general_purpose::STANDARD.encode(&iv),
+        "key_version": key_version,
+    });
+
+    Ok(Json(result))
+}
+
 /// Add a new namespace to a cluster via id
 #[utoipa::path(
     post,
@@ -3797,6 +5232,7 @@ pub async fn ui_auth_me(
 )]
 pub async fn post_create_cluster_namespaces(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PostNamespaceNames>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
@@ -3806,18 +5242,34 @@ pub async fn post_create_cluster_namespaces(
             "Null value in namespace entry".to_string(),
         ))
     } else {
+        let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|e| sanitize_db_error(e, "post_create_cluster_namespaces_begin"))?;
+
+        set_tenant_context(&mut tx, tenant_id).await?;
+
         sqlx::query(
             r#"
-        INSERT INTO namespaces (id, cluster_id, name)
-        SELECT gen_random_uuid(), $1, unnest($2::text[])
-        ON CONFLICT DO NOTHING
+        INSERT INTO namespaces (id, cluster_id, name, tenant_id)
+        SELECT gen_random_uuid(), $1, unnest($2::text[]), $3
+        ON CONFLICT (tenant_id, cluster_id, name) DO NOTHING
     "#,
         )
         .bind(id)
         .bind(data.namespace_names)
-        .execute(&state.pool)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "post_namespace"))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| sanitize_db_error(e, "post_create_cluster_namespaces_commit"))?;
+
         Ok((StatusCode::NO_CONTENT, String::new()))
     }
 }
@@ -3838,9 +5290,20 @@ pub async fn post_create_cluster_namespaces(
 )]
 pub async fn post_subscribe_clusters(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PostSubscriptions>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_subscribe_clusters_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Validation make sure that no 'service @ repo' of proposed cluster is a dedup of service @ different repo
     #[derive(sqlx::FromRow)]
     struct ClusterGroup {
@@ -3853,7 +5316,7 @@ pub async fn post_subscribe_clusters(
     "#,
     )
     .bind(id)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_subscribe_clusters_fetch_group"))?;
 
@@ -3902,7 +5365,7 @@ pub async fn post_subscribe_clusters(
         .bind(id)
         .bind(cluster_id)
         .bind(priority)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "post_subscribe_clusters_validate"))?;
 
@@ -3922,29 +5385,25 @@ pub async fn post_subscribe_clusters(
         }
     }
 
-    let list = data
-        .ids
-        .iter()
-        .map(|s| format!("('{}', '{}')", id, s))
-        .collect::<Vec<_>>();
-    sqlx::query(&format!(
-        "
-        INSERT INTO group_relationships
-        (cluster_group_id, cluster_id)
-        VALUES
-        {}
-        ON CONFLICT DO NOTHING
-    ",
-        list.join(",")
-    ))
-    .execute(&state.pool)
-    .await
-    .map_err(|e| sanitize_db_error(e, "post_subscribe_clusters_insert"))?;
+    for cluster_id in data.ids.iter() {
+        sqlx::query(
+            r#"
+            INSERT INTO group_relationships (tenant_id, cluster_group_id, cluster_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(cluster_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_subscribe_clusters_insert"))?;
+    }
 
-    tokio::time::sleep(std::time::Duration::from_millis(
-        state.read_replica_wait_in_ms,
-    ))
-    .await;
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_subscribe_clusters_commit"))?;
 
     // Parallelize sync operations for all clusters
     let sync_futures = data
@@ -3972,9 +5431,20 @@ pub async fn post_subscribe_clusters(
 )]
 pub async fn post_subscribe_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PostSubscriptions>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     #[derive(sqlx::FromRow)]
     struct ClusterGroup {
         priority: Option<i32>,
@@ -3986,7 +5456,7 @@ pub async fn post_subscribe_service_definitions(
     "#,
     )
     .bind(id)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_fetch_group"))?;
 
@@ -4030,7 +5500,7 @@ pub async fn post_subscribe_service_definitions(
         .bind(id)
         .bind(service_definition_id)
         .bind(priority)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_validate"))?;
 
@@ -4048,7 +5518,7 @@ pub async fn post_subscribe_service_definitions(
             "#,
             )
             .bind(service_definition_id)
-            .fetch_one(&state.readonly_pool)
+            .fetch_one(&mut *tx)
             .await
             .map(|r| r.name)
             .unwrap_or_else(|_| service_definition_id.to_string());
@@ -4064,28 +5534,21 @@ pub async fn post_subscribe_service_definitions(
         }
     }
 
-    let list = data
-        .ids
-        .into_iter()
-        .map(|s| format!("('{}', '{}')", id, s))
-        .collect::<Vec<_>>();
-    sqlx::query(&format!(
-        "
-        INSERT INTO service_definition_cluster_group_relationships
-        (cluster_group_id, service_definition_id)
-        VALUES
-        {}
-    ",
-        list.join(",")
-    ))
-    .execute(&state.pool)
-    .await
-    .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_insert"))?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(
-        state.read_replica_wait_in_ms,
-    ))
-    .await;
+    for service_definition_id in data.ids.iter() {
+        sqlx::query(
+            r#"
+            INSERT INTO service_definition_cluster_group_relationships (tenant_id, cluster_group_id, service_definition_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(service_definition_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_insert"))?;
+    }
 
     #[derive(sqlx::FromRow)]
     struct Cluster {
@@ -4105,9 +5568,13 @@ pub async fn post_subscribe_service_definitions(
     "#,
     )
     .bind(id)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_fetch_clusters"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_subscribe_service_definitions_commit"))?;
 
     // Parallelize sync operations for all clusters
     let sync_futures = clusters
@@ -4134,9 +5601,20 @@ pub async fn post_subscribe_service_definitions(
 )]
 pub async fn put_subscribe_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PostSubscriptions>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Validation make sure that no registered clusters of this group have the same service already associated via another group
     #[derive(sqlx::FromRow)]
     struct ClusterGroup {
@@ -4149,7 +5627,7 @@ pub async fn put_subscribe_service_definitions(
     "#,
     )
     .bind(id)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_fetch_group"))?;
 
@@ -4193,7 +5671,7 @@ pub async fn put_subscribe_service_definitions(
         .bind(id)
         .bind(service_definition_id)
         .bind(priority)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_validate"))?;
 
@@ -4233,7 +5711,7 @@ pub async fn put_subscribe_service_definitions(
         )
         .bind(id)
         .bind(service_definition_id)
-        .fetch_one(&state.readonly_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_fetch_old"))?;
 
@@ -4242,33 +5720,25 @@ pub async fn put_subscribe_service_definitions(
             )
                 .bind(id)
                 .bind(old_service_definition.id)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_delete"))?;
     }
 
-    let list = data
-        .ids
-        .into_iter()
-        .map(|s| format!("('{}', '{}')", id, s))
-        .collect::<Vec<_>>();
-    sqlx::query(&format!(
-        "
-        INSERT INTO service_definition_cluster_group_relationships
-        (cluster_group_id, service_definition_id)
-        VALUES
-        {}
-    ",
-        list.join(",")
-    ))
-    .execute(&state.pool)
-    .await
-    .map_err(|e| sanitize_db_error(e, "post_global_repo_service_insert"))?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(
-        state.read_replica_wait_in_ms,
-    ))
-    .await;
+    for service_definition_id in data.ids.iter() {
+        sqlx::query(
+            r#"
+            INSERT INTO service_definition_cluster_group_relationships (tenant_id, cluster_group_id, service_definition_id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(service_definition_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_insert"))?;
+    }
 
     #[derive(sqlx::FromRow)]
     struct Cluster {
@@ -4288,9 +5758,13 @@ pub async fn put_subscribe_service_definitions(
     "#,
     )
     .bind(id)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_fetch_clusters"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_subscribe_service_definitions_commit"))?;
 
     // Parallelize sync operations for all clusters
     let sync_futures = clusters
@@ -4320,14 +5794,16 @@ pub async fn put_subscribe_service_definitions(
 )]
 pub async fn get_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PaginatedResponse<ServiceDefinitionData>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
 
     // Get total count
     let (total,): (i64,) =
         sqlx::query_as(r#"SELECT COUNT(*) FROM service_definitions WHERE deleted_at IS NULL"#)
-            .fetch_one(&state.readonly_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "get_service_definitions_count"))?;
 
@@ -4361,9 +5837,13 @@ pub async fn get_service_definitions(
     )
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_service_definitions"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_service_definitions_commit"))?;
 
     Ok(Json(PaginatedResponse::new(
         data,
@@ -4392,9 +5872,11 @@ pub async fn get_service_definitions(
 )]
 pub async fn get_service_releases(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ReleaseStatus>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let releases = sqlx::query_as::<_, ReleaseData>(
         r#"
@@ -4446,9 +5928,13 @@ pub async fn get_service_releases(
     .bind(id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_service_releases"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_service_releases_commit"))?;
 
     Ok(Json(
         releases
@@ -4477,8 +5963,11 @@ pub async fn get_service_releases(
 )]
 pub async fn post_repo(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<PostRepo>,
 ) -> Result<Json<RepoData>, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
     let parsed = parse_repo_url(&data.url).ok_or((
         StatusCode::UNPROCESSABLE_ENTITY,
         "Invalid repo URL. Expected like https://<host>/<org>/<repo> or git@<host>:<org>/<repo>.git"
@@ -4514,11 +6003,19 @@ pub async fn post_repo(
     let web_base_url = data.web_base_url.clone().unwrap_or(parsed.web_base_url);
     let api_base_url = data.api_base_url.clone().unwrap_or(parsed.api_base_url);
 
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_repo_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     let ci_upsert = sqlx::query_as::<_, RepoData>(
         r#"
-        INSERT INTO repos (id, org, repo, provider, host, web_base_url, api_base_url)
-        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
-        ON CONFLICT ON CONSTRAINT unique_repo_identity_ci
+        INSERT INTO repos (id, org, repo, provider, host, web_base_url, api_base_url, tenant_id)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT ON CONSTRAINT unique_repo_identity_per_tenant
         DO UPDATE SET
             provider = EXCLUDED.provider,
             web_base_url = EXCLUDED.web_base_url,
@@ -4531,45 +6028,17 @@ pub async fn post_repo(
     .bind(&provider)
     .bind(&parsed.host)
     .bind(&web_base_url)
-    .bind(&api_base_url);
+    .bind(&api_base_url)
+    .bind(tenant_id);
 
-    let repo = match ci_upsert.fetch_one(&state.pool).await {
-        Ok(repo) => repo,
-        Err(sqlx::Error::Database(db_err)) => {
-            // If the case-insensitive constraint isn't present (or migration is mid-flight),
-            // fall back to the older constraint so repo creation still works.
-            let pg_code = db_err.code().map(|c| c.to_string());
-            if matches!(pg_code.as_deref(), Some("42704") | Some("42P10")) {
-                sqlx::query_as::<_, RepoData>(
-                    r#"
-                    INSERT INTO repos (id, org, repo, provider, host, web_base_url, api_base_url)
-                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
-                    ON CONFLICT ON CONSTRAINT unique_repo_identity
-                    DO UPDATE SET
-                        provider = EXCLUDED.provider,
-                        web_base_url = EXCLUDED.web_base_url,
-                        api_base_url = EXCLUDED.api_base_url
-                    RETURNING id, provider, host, web_base_url, api_base_url, org, repo
-                    "#,
-                )
-                .bind(&parsed.org)
-                .bind(&parsed.repo)
-                .bind(&provider)
-                .bind(&parsed.host)
-                .bind(&web_base_url)
-                .bind(&api_base_url)
-                .fetch_one(&state.pool)
-                .await
-                .map_err(|e| sanitize_db_error(e, "post_repo_upsert_legacy"))?
-            } else {
-                return Err(sanitize_db_error(
-                    sqlx::Error::Database(db_err),
-                    "post_repo_upsert",
-                ));
-            }
-        }
-        Err(e) => return Err(sanitize_db_error(e, "post_repo_upsert")),
-    };
+    let repo = ci_upsert
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_repo_upsert"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_repo_commit"))?;
 
     Ok(Json(repo))
 }
@@ -4593,13 +6062,15 @@ pub async fn post_repo(
 )]
 pub async fn get_repos(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PaginatedResponse<RepoData>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
 
     // Get total count
     let (total,): (i64,) = sqlx::query_as(r#"SELECT COUNT(*) FROM repos"#)
-        .fetch_one(&state.readonly_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_repos_count"))?;
 
@@ -4609,9 +6080,13 @@ pub async fn get_repos(
     )
             .bind(pagination.limit)
             .bind(pagination.offset)
-            .fetch_all(&state.readonly_pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "get_repos"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_repos_commit"))?;
 
     Ok(Json(PaginatedResponse::new(
         data,
@@ -4636,19 +6111,23 @@ pub async fn get_repos(
 )]
 pub async fn get_repo(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<RepoData>, (StatusCode, String)> {
-    Ok(Json(
-        sqlx::query_as::<_, RepoData>(
-            r#"
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+    let result = sqlx::query_as::<_, RepoData>(
+        r#"
             SELECT id, provider, host, web_base_url, api_base_url, org, repo FROM repos WHERE id = $1
         "#,
-        )
-        .bind(id)
-        .fetch_one(&state.readonly_pool)
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_repo"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_repo"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_repo_commit"))?;
+    Ok(Json(result))
 }
 
 /// Gets branches for a specific repo via id
@@ -4670,13 +6149,14 @@ pub async fn get_repo(
 )]
 pub async fn get_branches(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<RepoBranches>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, RepoBranches>(
-            r#"
+    let result = sqlx::query_as::<_, RepoBranches>(
+        r#"
             SELECT
                 repo_branches.id as id,
                 repos.provider as provider,
@@ -4696,14 +6176,17 @@ pub async fn get_branches(
             ORDER BY branch
             LIMIT $2 OFFSET $3
         "#,
-        )
-        .bind(id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_branches"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_branches"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_branches_commit"))?;
+    Ok(Json(result))
 }
 
 /// Add a new branch to a specific repo via id
@@ -4722,6 +6205,7 @@ pub async fn get_branches(
 )]
 pub async fn post_branch(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PostBranch>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
@@ -4733,22 +6217,27 @@ pub async fn post_branch(
         ));
     }
 
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(|e| sanitize_db_error(e, "post_branch_begin"))?;
 
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Create the branch and capture its ID so we can copy existing repo services onto it.
     let new_branch_id: Uuid = sqlx::query_scalar(
         r#"
-            INSERT INTO repo_branches (id, repo_id, branch)
-            VALUES (gen_random_uuid(), $1, $2)
+            INSERT INTO repo_branches (id, repo_id, branch, tenant_id)
+            VALUES (gen_random_uuid(), $1, $2, $3)
             RETURNING id
         "#,
     )
     .bind(id)
     .bind(branch)
+    .bind(tenant_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_branch_insert"))?;
@@ -4783,7 +6272,8 @@ pub async fn post_branch(
                 repo_branch_id,
                 name,
                 source_branch_requirements,
-                manifest_path_template
+                manifest_path_template,
+                tenant_id
             )
             SELECT
                 gen_random_uuid(),
@@ -4796,14 +6286,16 @@ pub async fn post_branch(
                 CASE
                     WHEN es.manifest_template_distinct_count = 1 AND es.manifest_template_single IS NOT NULL THEN es.manifest_template_single
                     ELSE '{cluster}/manifests/{namespace}/' || es.name || '/' || es.name || '.yaml'
-                END
+                END,
+                $3
             FROM
                 existing_services es
-            ON CONFLICT (repo_branch_id, name) DO NOTHING
+            ON CONFLICT (tenant_id, repo_branch_id, name) DO NOTHING
         "#,
     )
     .bind(new_branch_id)
     .bind(id)
+    .bind(tenant_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_branch_copy_union_services"))?;
@@ -4834,13 +6326,14 @@ pub async fn post_branch(
 )]
 pub async fn get_branch_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ServiceDefinitionData>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, ServiceDefinitionData>(
-            r#"
+    let result = sqlx::query_as::<_, ServiceDefinitionData>(
+        r#"
             SELECT
                 service_definitions.id AS service_definition_id,
                 service_definitions.deleted_at AS service_deleted_at,
@@ -4869,14 +6362,17 @@ pub async fn get_branch_service_definitions(
             ORDER BY service_definitions.name
             LIMIT $2 OFFSET $3
         "#,
-        )
-        .bind(id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_branch_service_definitions"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_branch_service_definitions"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_branch_service_definitions_commit"))?;
+    Ok(Json(result))
 }
 
 /// Given a branch id, get a list other branches with "sync" configuration data
@@ -4898,13 +6394,14 @@ pub async fn get_branch_service_definitions(
 )]
 pub async fn get_autosync_data(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<AutosyncData>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, AutosyncData>(
-            r#"
+    let result = sqlx::query_as::<_, AutosyncData>(
+        r#"
             SELECT
                 id,
                 branch,
@@ -4940,14 +6437,17 @@ pub async fn get_autosync_data(
             ORDER BY branch
             LIMIT $2 OFFSET $3;
         "#,
-        )
-        .bind(id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_branch_service_definitions_fetch"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_branch_service_definitions_fetch"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_autosync_data_commit"))?;
+    Ok(Json(result))
 }
 
 /// Update a branch to by synced with other branches
@@ -4965,9 +6465,20 @@ pub async fn get_autosync_data(
 )]
 pub async fn put_branch_autosync(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<ServiceAutosyncBranches>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_branch_autosync_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
             UPDATE
@@ -4980,7 +6491,7 @@ pub async fn put_branch_autosync(
     )
     .bind(id)
     .bind(&data.ids)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_branch_autosync_update"))?;
 
@@ -5004,22 +6515,28 @@ pub async fn put_branch_autosync(
                     )
             )
             INSERT INTO
-                service_definitions (id, repo_branch_id, name, deleted_at, manifest_path_template)
+                service_definitions (id, repo_branch_id, name, deleted_at, manifest_path_template, tenant_id)
             SELECT
                 gen_random_uuid(),
                 $1,
                 service_names.name,
                 -- Instead of preventing sync, add the resource as deleted
                 service_names.deleted_at,
-                service_names.manifest_path_template
+                service_names.manifest_path_template,
+                $2
             FROM
                 service_names ON CONFLICT DO NOTHING
         "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .bind(tenant_id)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "put_branch_autosync_insert"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "put_branch_autosync_commit"))?;
 
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
@@ -5039,6 +6556,7 @@ pub async fn put_branch_autosync(
 )]
 pub async fn post_branch_service(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<ServiceName>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
@@ -5068,6 +6586,16 @@ pub async fn post_branch_service(
     // ```
     //
     // For now, just re-enable the service that is synced with this branch
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_branch_service_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
             WITH matching_repo_branches AS (
@@ -5080,15 +6608,16 @@ pub async fn post_branch_service(
                     OR $1 = ANY(service_autosync)
             )
             INSERT INTO
-                service_definitions (id, repo_branch_id, name, manifest_path_template)
+                service_definitions (id, repo_branch_id, name, manifest_path_template, tenant_id)
             SELECT
                 gen_random_uuid(),
                 matching_repo_branches.id,
                 $2,
-                $3
+                $3,
+                $4
             FROM
                 matching_repo_branches
-            ON CONFLICT (repo_branch_id, name) DO UPDATE SET
+            ON CONFLICT (tenant_id, repo_branch_id, name) DO UPDATE SET
                 deleted_at = NULL
 
         "#,
@@ -5099,9 +6628,14 @@ pub async fn post_branch_service(
         "{{cluster}}/manifests/{{namespace}}/{}/{}.yaml",
         &data.name, &data.name
     ))
-    .execute(&state.pool)
+    .bind(tenant_id)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_branch_service"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_branch_service_commit"))?;
     Ok((StatusCode::NO_CONTENT, String::new()))
 }
 
@@ -5124,13 +6658,14 @@ pub async fn post_branch_service(
 )]
 pub async fn get_repo_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ServiceName>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, ServiceName>(
-            r#"
+    let result = sqlx::query_as::<_, ServiceName>(
+        r#"
             SELECT
                 service_definitions.name,
                 MIN(service_definitions.manifest_path_template) AS manifest_path_template
@@ -5161,14 +6696,17 @@ pub async fn get_repo_service_definitions(
             ORDER BY service_definitions.name
             LIMIT $2 OFFSET $3;
         "#,
-        )
-        .bind(id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_repo_service_definitions"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_repo_service_definitions"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_repo_service_definitions_commit"))?;
+    Ok(Json(result))
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow, ToSchema)]
@@ -5193,17 +6731,22 @@ pub struct NamespaceData {
 )]
 pub async fn get_namespaces_via_cluster_name(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(cluster_name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let result =  sqlx::query_as::<_, NamespaceData>(r#"SELECT id, name FROM namespaces WHERE cluster_id = (SELECT id FROM clusters WHERE clusters.name = $1 AND clusters.deleted_at IS NULL)"#)
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
+    let result = sqlx::query_as::<_, NamespaceData>(r#"SELECT id, name FROM namespaces WHERE cluster_id = (SELECT id FROM clusters WHERE clusters.name = $1 AND clusters.deleted_at IS NULL)"#)
         .bind(&cluster_name)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "get_namespaces_via_cluster_name"))?
         .into_iter()
         .map(|r| (r.name, r.id.to_string()))
         .collect::<HashMap<String, String>>();
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_namespaces_via_cluster_name_commit"))?;
     Ok(Json(json!(result)))
 }
 
@@ -5223,6 +6766,7 @@ pub async fn get_namespaces_via_cluster_name(
 )]
 pub async fn post_global_repo_service(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<ServiceName>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
@@ -5252,29 +6796,45 @@ pub async fn post_global_repo_service(
         // ```
         //
         // For now, just re-enable the service
+        let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|e| sanitize_db_error(e, "post_global_repo_service_begin"))?;
+
+        set_tenant_context(&mut tx, tenant_id).await?;
+
         sqlx::query(
             r#"
         INSERT INTO
-            service_definitions (id, repo_branch_id, name, manifest_path_template)
+            service_definitions (id, repo_branch_id, name, manifest_path_template, tenant_id)
         SELECT
             GEN_RANDOM_UUID(),
             id,
             $2,
-            $3
+            $3,
+            $4
         FROM
             repo_branches
         WHERE
             repo_id = $1
-        ON CONFLICT (repo_branch_id, name) DO UPDATE SET
+        ON CONFLICT (tenant_id, repo_branch_id, name) DO UPDATE SET
             deleted_at = NULL
     "#,
         )
         .bind(id)
         .bind(&data.name)
         .bind(&template)
-        .execute(&state.pool)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "post_branch_service_upsert"))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| sanitize_db_error(e, "post_global_repo_service_commit"))?;
 
         Ok((StatusCode::NO_CONTENT, String::new()))
     }
@@ -5284,7 +6844,14 @@ async fn insert_new_releases_to_namespace(
     db: &sqlx::Pool<sqlx::Postgres>,
     namespace_id: &Uuid,
     service_definitions: &[ServiceDefinitionInfo],
+    tenant_id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tx = db.begin().await?;
+
+    // Set tenant context for RLS
+    let query = format!("SET LOCAL app.tenant_id = '{}';", tenant_id);
+    sqlx::query(&query).execute(&mut *tx).await?;
+
     let cluster_data = sqlx::query_as::<_, ClusterNamespaceServicesData>(
         r#"
                 SELECT
@@ -5305,7 +6872,7 @@ async fn insert_new_releases_to_namespace(
             "#,
     )
     .bind(namespace_id)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await?;
 
     let cluster_name = cluster_data.name;
@@ -5316,6 +6883,7 @@ async fn insert_new_releases_to_namespace(
         INSERT INTO releases
         (
             id,
+            tenant_id,
             service_id,
             namespace_id,
             path,
@@ -5346,6 +6914,7 @@ async fn insert_new_releases_to_namespace(
         let new_item = format!(
             r#"(
                 (SELECT GEN_RANDOM_UUID()),
+                '{}',
                 (SELECT GEN_RANDOM_UUID()),
                 '{}',
                 '{}',
@@ -5355,7 +6924,7 @@ async fn insert_new_releases_to_namespace(
                 '',
                 ''
             )"#,
-            namespace_id, path, item.name, item.repo_branch_id
+            tenant_id, namespace_id, path, item.name, item.repo_branch_id
         );
 
         if index == 0 {
@@ -5365,7 +6934,8 @@ async fn insert_new_releases_to_namespace(
         }
     }
 
-    sqlx::query(&query).execute(db).await?;
+    sqlx::query(&query).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -5373,7 +6943,14 @@ async fn get_new_service_definitions_to_namespace(
     db: &sqlx::Pool<sqlx::Postgres>,
     namespace_id: &Uuid,
     service_definition_ids: &Vec<Uuid>,
+    tenant_id: Uuid,
 ) -> Result<Vec<ServiceDefinitionInfo>, Box<dyn std::error::Error>> {
+    let mut tx = db.begin().await?;
+
+    // Set tenant context for RLS
+    let query = format!("SET LOCAL app.tenant_id = '{}';", tenant_id);
+    sqlx::query(&query).execute(&mut *tx).await?;
+
     let existing_releases = sqlx::query_as::<_, NamespaceServiceData>(
         r#"
         SELECT
@@ -5390,14 +6967,14 @@ async fn get_new_service_definitions_to_namespace(
         ;"#,
     )
     .bind(namespace_id)
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
 
     let service_info = sqlx::query_as::<_, ServiceDefinitionInfo>(
         "SELECT id, name, repo_branch_id, manifest_path_template FROM service_definitions WHERE id = ANY($1) AND service_definitions.deleted_at IS NULL",
     )
     .bind(service_definition_ids)
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
 
     let existing_service_names = existing_releases
@@ -5434,24 +7011,31 @@ struct ServiceDefinitionInfo {
 )]
 pub async fn post_init_release(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<PostInitReleases>,
 ) -> Result<Json<Vec<AdditionalInstallation>>, (StatusCode, String)> {
-    let new_service_definitions =
-        get_new_service_definitions_to_namespace(&state.pool, &id, &data.service_definition_ids)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed finding service_definitions new to namespace: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database error occurred".to_string(),
-                )
-            })?;
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let new_service_definitions = get_new_service_definitions_to_namespace(
+        &state.pool,
+        &id,
+        &data.service_definition_ids,
+        tenant_id,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed finding service_definitions new to namespace: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database error occurred".to_string(),
+        )
+    })?;
 
     let additional_installations = if new_service_definitions.is_empty() {
         vec![]
     } else {
-        insert_new_releases_to_namespace(&state.pool, &id, &new_service_definitions)
+        insert_new_releases_to_namespace(&state.pool, &id, &new_service_definitions, tenant_id)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to insert new service release to namespace: {}", e);
@@ -5469,12 +7053,31 @@ pub async fn post_init_release(
             exists: bool,
         }
 
-        let new_service_definitions_stream = stream::iter(new_service_definitions);
+        // Create a transaction with tenant context for the additional installations query
+        let mut tx = state.pool.begin().await.map_err(|e| {
+            tracing::error!("Failed to begin transaction: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error occurred".to_string(),
+            )
+        })?;
 
-        let db_pool = &state.pool.clone();
-        let service_definitions_new_to_cluster_namespaces = new_service_definitions_stream
-            .fold(vec![], |mut a, service_definition| async move  {
-                let clusters_with_same_namespace_in_group_with_service_relationship = match sqlx::query_as::<_, ClusterInGroupWithServiceDefinition>(
+        let ctx_query = format!("SET LOCAL app.tenant_id = '{}';", tenant_id);
+        sqlx::query(&ctx_query)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to set tenant context: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database error occurred".to_string(),
+                )
+            })?;
+
+        let mut service_definitions_new_to_cluster_namespaces = vec![];
+
+        for service_definition in new_service_definitions.iter() {
+            let clusters_with_same_namespace_in_group_with_service_relationship = sqlx::query_as::<_, ClusterInGroupWithServiceDefinition>(
                     r#"
                     SELECT
                         clusters_in_group_with_common_namespace.namespace_id AS namespace_id,
@@ -5567,30 +7170,25 @@ pub async fn post_init_release(
                 )
                 .bind(id)
                 .bind(service_definition.id)
-                .fetch_all(db_pool)
-                .await{
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("Failed to find additional installation canidates: {}", e);
-                        vec![]
-                    },
-                };
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to find additional installation candidates: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Database error occurred".to_string())
+                })?;
 
-                clusters_with_same_namespace_in_group_with_service_relationship
-                    .iter()
-                    .filter(|item| !item.exists)
-                    .for_each(|item| {
-                        a.push(AdditionalInstallation{
-                            namespace_id: item.namespace_id,
-                            namespace_name: item.namespace_name.clone(),
-                            service_definition_id: service_definition.id,
-                            cluster_name: item.cluster_name.clone(),
-                            service_name: service_definition.name.clone(),
-                        })
+            for item in clusters_with_same_namespace_in_group_with_service_relationship.iter() {
+                if !item.exists {
+                    service_definitions_new_to_cluster_namespaces.push(AdditionalInstallation {
+                        namespace_id: item.namespace_id,
+                        namespace_name: item.namespace_name.clone(),
+                        service_definition_id: service_definition.id,
+                        cluster_name: item.cluster_name.clone(),
+                        service_name: service_definition.name.clone(),
                     });
-                a
-            })
-        .await;
+                }
+            }
+        }
 
         service_definitions_new_to_cluster_namespaces
     };
@@ -5617,6 +7215,7 @@ pub async fn post_init_release(
 )]
 pub async fn post_additional_installations(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<Vec<PostAdditionalInstallation>>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     if data.is_empty() {
@@ -5625,6 +7224,8 @@ pub async fn post_additional_installations(
             String::from("No additional installations sent for processing"),
         ));
     }
+
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
 
     let installation_map =
         data.iter()
@@ -5643,6 +7244,7 @@ pub async fn post_additional_installations(
             &state.pool,
             namespace_id,
             service_definition_id,
+            tenant_id,
         )
         .await
         .map_err(|e| {
@@ -5653,15 +7255,20 @@ pub async fn post_additional_installations(
             )
         })?;
 
-        insert_new_releases_to_namespace(&state.pool, namespace_id, &service_definitions)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to insert additional releases: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    String::from("Failed to insert releases for namespace"),
-                )
-            })?;
+        insert_new_releases_to_namespace(
+            &state.pool,
+            namespace_id,
+            &service_definitions,
+            tenant_id,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to insert additional releases: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                String::from("Failed to insert releases for namespace"),
+            )
+        })?;
     }
 
     Ok((StatusCode::NO_CONTENT, String::new()))
@@ -5685,8 +7292,11 @@ pub async fn post_additional_installations(
 )]
 pub async fn post_user(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<PostUser>,
 ) -> Result<Json<UserData>, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
     let secret = util::generate_random_string(256);
 
     let manifest = match data.context {
@@ -5760,17 +7370,26 @@ pub async fn post_user(
             String::from("Failed to create secure hash for user"),
         )
     })?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_user_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
             INSERT INTO users
-            (id, name, hash)
+            (id, name, hash, tenant_id)
             VALUES
-            ((SELECT gen_random_uuid()), $1, $2)
+            ((SELECT gen_random_uuid()), $1, $2, $3)
         "#,
     )
     .bind(&data.name)
     .bind(&hash)
-    .execute(&state.pool)
+    .bind(tenant_id)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(database_error) => {
@@ -5807,6 +7426,10 @@ pub async fn post_user(
             )
         }
     })?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_user_commit"))?;
 
     Ok(Json(UserData { secret, manifest }))
 }
@@ -5862,8 +7485,19 @@ async fn clean_up_service_relationships(
 )]
 pub async fn delete_service_definitions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_definitions_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
         UPDATE
@@ -5876,9 +7510,13 @@ pub async fn delete_service_definitions(
         "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_definitions_commit"))?;
 
     clean_up_service_relationships(&state.pool).await?;
 
@@ -5900,8 +7538,19 @@ pub async fn delete_service_definitions(
 )]
 pub async fn delete_service(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     sqlx::query(
         r#"
         UPDATE
@@ -5914,9 +7563,13 @@ pub async fn delete_service(
         "#,
     )
     .bind(&name)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_commit"))?;
 
     clean_up_service_relationships(&state.pool).await?;
 
@@ -6142,13 +7795,14 @@ pub async fn list_resource_diffs(
 )]
 pub async fn get_namespace_service_versions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(namespace_id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<ServiceVersionWithDetails>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
-    Ok(Json(
-        sqlx::query_as::<_, ServiceVersionWithDetails>(
-            r#"
+    let result = sqlx::query_as::<_, ServiceVersionWithDetails>(
+        r#"
             SELECT
                 sv.id,
                 sv.created_at,
@@ -6184,14 +7838,17 @@ pub async fn get_namespace_service_versions(
             ORDER BY sv.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
-        )
-        .bind(namespace_id)
-        .bind(pagination.limit)
-        .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+    )
+    .bind(namespace_id)
+    .bind(pagination.limit)
+    .bind(pagination.offset)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| sanitize_db_error(e, "get_namespace_service_versions"))?;
+    tx.commit()
         .await
-        .map_err(|e| sanitize_db_error(e, "get_namespace_service_versions"))?,
-    ))
+        .map_err(|e| sanitize_db_error(e, "get_namespace_service_versions_commit"))?;
+    Ok(Json(result))
 }
 
 /// Get service versions for a specific service definition
@@ -6215,10 +7872,12 @@ pub async fn get_namespace_service_versions(
 )]
 pub async fn get_service_definition_versions(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(service_definition_id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<ServiceVersionWithDetails>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
     let include_deprecated = params
         .get("include_deprecated")
@@ -6266,7 +7925,7 @@ pub async fn get_service_definition_versions(
         .bind(service_definition_id)
         .bind(pagination.limit)
         .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
     } else {
         sqlx::query_as::<_, ServiceVersionWithDetails>(
@@ -6310,13 +7969,15 @@ pub async fn get_service_definition_versions(
         .bind(service_definition_id)
         .bind(pagination.limit)
         .bind(pagination.offset)
-        .fetch_all(&state.readonly_pool)
+        .fetch_all(&mut *tx)
         .await
     };
 
-    Ok(Json(query.map_err(|e| {
-        sanitize_db_error(e, "get_service_definition_versions")
-    })?))
+    let result = query.map_err(|e| sanitize_db_error(e, "get_service_definition_versions"))?;
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_service_definition_versions_commit"))?;
+    Ok(Json(result))
 }
 
 /// Create a new service version (for CI/CD pipelines)
@@ -6337,6 +7998,7 @@ pub async fn get_service_definition_versions(
 )]
 pub async fn post_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Json(data): Json<CreateServiceVersion>,
 ) -> Result<(StatusCode, Json<ServiceVersionData>), (StatusCode, String)> {
     // Validate git_sha format (should be 40 char hex)
@@ -6346,6 +8008,16 @@ pub async fn post_service_version(
             "git_sha must be a 40-character hex string".to_string(),
         ));
     }
+
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_service_version_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
 
     let git_sha_short = data.git_sha[..7].to_string();
 
@@ -6370,7 +8042,7 @@ pub async fn post_service_version(
     .bind(data.service_definition_id)
     .bind(data.namespace_id)
     .bind(&data.git_sha)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await
     .map(|rows| rows.len() as i64)
     .unwrap_or(0);
@@ -6413,7 +8085,7 @@ pub async fn post_service_version(
     .bind(data.service_definition_id)
     .bind(data.namespace_id)
     .bind(&data.git_sha)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_service_version"))?;
 
@@ -6423,6 +8095,9 @@ pub async fn post_service_version(
             "Manual version: Version with git_sha {} already exists, returning existing",
             &data.git_sha[..7]
         );
+        tx.commit()
+            .await
+            .map_err(|e| sanitize_db_error(e, "post_service_version_commit"))?;
         return Ok((StatusCode::OK, Json(existing)));
     }
 
@@ -6438,9 +8113,10 @@ pub async fn post_service_version(
             path,
             hash,
             source,
-            source_metadata
+            source_metadata,
+            tenant_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING
             id,
             created_at,
@@ -6468,9 +8144,14 @@ pub async fn post_service_version(
     .bind(&data.hash)
     .bind(&data.source)
     .bind(&data.source_metadata)
-    .fetch_one(&state.pool)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_service_version"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_service_version_commit"))?;
 
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -6495,9 +8176,20 @@ pub async fn post_service_version(
 )]
 pub async fn post_deprecate_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(data): Json<DeprecateServiceVersion>,
 ) -> Result<Json<ServiceVersionData>, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_deprecate_service_version_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     let result = sqlx::query_as::<_, ServiceVersionData>(
         r#"
         UPDATE service_versions
@@ -6528,9 +8220,13 @@ pub async fn post_deprecate_service_version(
     .bind(id)
     .bind(&data.deprecated_by)
     .bind(&data.deprecated_reason)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_deprecate_service_version"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_deprecate_service_version_commit"))?;
 
     Ok(Json(result))
 }
@@ -6556,9 +8252,20 @@ pub async fn post_deprecate_service_version(
 )]
 pub async fn post_pin_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     body: Option<Json<PinServiceVersion>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_pin_service_version_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     let pinned_by = body.and_then(|b| b.pinned_by.clone());
     let result = sqlx::query(
         r#"
@@ -6569,7 +8276,7 @@ pub async fn post_pin_service_version(
     )
     .bind(id)
     .bind(&pinned_by)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_pin_service_version"))?;
 
@@ -6579,6 +8286,10 @@ pub async fn post_pin_service_version(
             "Service version not found or already deprecated".to_string(),
         ));
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_pin_service_version_commit"))?;
 
     Ok(StatusCode::OK)
 }
@@ -6602,8 +8313,19 @@ pub async fn post_pin_service_version(
 )]
 pub async fn post_unpin_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_unpin_service_version_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     let result = sqlx::query(
         r#"
         UPDATE service_versions
@@ -6612,7 +8334,7 @@ pub async fn post_unpin_service_version(
         "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "post_unpin_service_version"))?;
 
@@ -6622,6 +8344,10 @@ pub async fn post_unpin_service_version(
             "Service version not found".to_string(),
         ));
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "post_unpin_service_version_commit"))?;
 
     Ok(StatusCode::OK)
 }
@@ -6645,15 +8371,26 @@ pub async fn post_unpin_service_version(
 )]
 pub async fn delete_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_version_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     let result = sqlx::query(
         r#"
         DELETE FROM service_versions WHERE id = $1
         "#,
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_service_version"))?;
 
@@ -6663,6 +8400,10 @@ pub async fn delete_service_version(
             "Service version not found".to_string(),
         ));
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_service_version_commit"))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -6686,8 +8427,10 @@ pub async fn delete_service_version(
 )]
 pub async fn get_service_version(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ServiceVersionWithDetails>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let result = sqlx::query_as::<_, ServiceVersionWithDetails>(
         r#"
         SELECT
@@ -6724,10 +8467,13 @@ pub async fn get_service_version(
         "#,
     )
     .bind(id)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_service_version"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_service_version_commit"))?;
     Ok(Json(result))
 }
 
@@ -6805,6 +8551,7 @@ fn validate_path_template(template: &str) -> PathTemplateValidation {
 )]
 pub async fn update_manifest_path_template(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateManifestPathTemplate>,
 ) -> Result<Json<PathTemplateValidation>, (StatusCode, String)> {
@@ -6820,6 +8567,16 @@ pub async fn update_manifest_path_template(
         ));
     }
 
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "update_manifest_path_template_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Update the service definition
     let result = sqlx::query(
         r#"
@@ -6830,7 +8587,7 @@ pub async fn update_manifest_path_template(
     )
     .bind(&body.manifest_path_template)
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "update_manifest_path_template"))?;
 
@@ -6840,6 +8597,10 @@ pub async fn update_manifest_path_template(
             "Service definition not found".to_string(),
         ));
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "update_manifest_path_template_commit"))?;
 
     Ok(Json(validation))
 }
@@ -6863,8 +8624,10 @@ pub async fn update_manifest_path_template(
 )]
 pub async fn get_manifest_path_template(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Option<String>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let result = sqlx::query_scalar::<_, Option<String>>(
         r#"
         SELECT manifest_path_template
@@ -6873,10 +8636,13 @@ pub async fn get_manifest_path_template(
         "#,
     )
     .bind(id)
-    .fetch_one(&state.readonly_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_manifest_path_template"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_manifest_path_template_commit"))?;
     Ok(Json(result))
 }
 
@@ -6917,8 +8683,10 @@ pub async fn validate_path_template_endpoint(
 )]
 pub async fn get_repo_webhook(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(repo_id): Path<Uuid>,
 ) -> Result<Json<Option<RepoWebhookData>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let result = sqlx::query_as::<_, RepoWebhookData>(
         r#"
         SELECT 
@@ -6938,10 +8706,13 @@ pub async fn get_repo_webhook(
         "#,
     )
     .bind(repo_id)
-    .fetch_optional(&state.readonly_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_repo_webhook"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_repo_webhook_commit"))?;
     Ok(Json(result))
 }
 
@@ -6968,9 +8739,20 @@ pub async fn get_repo_webhook(
 )]
 pub async fn register_repo_webhook(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(repo_id): Path<Uuid>,
     Json(body): Json<RegisterRepoWebhookRequest>,
 ) -> Result<Json<RegisterRepoWebhookResponse>, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "register_repo_webhook_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Get the repo info
     let repo = sqlx::query_as::<_, RepoData>(
         r#"
@@ -6987,7 +8769,7 @@ pub async fn register_repo_webhook(
         "#,
     )
     .bind(repo_id)
-    .fetch_optional(&state.readonly_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "register_repo_webhook"))?
     .ok_or((StatusCode::NOT_FOUND, "Repo not found".to_string()))?;
@@ -7005,7 +8787,7 @@ pub async fn register_repo_webhook(
         r#"SELECT id, deleted_at FROM repo_webhooks WHERE repo_id = $1"#,
     )
     .bind(repo_id)
-    .fetch_optional(&state.readonly_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "register_repo_webhook"))?;
 
@@ -7110,14 +8892,14 @@ pub async fn register_repo_webhook(
         .bind(provider_webhook_id)
         .bind(&webhook_secret)
         .bind(&webhook_secret_hash)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "register_repo_webhook"))?
     } else {
         sqlx::query_scalar::<_, Uuid>(
             r#"
-            INSERT INTO repo_webhooks (repo_id, provider_webhook_id, secret, secret_hash, active)
-            VALUES ($1, $2, $3, $4, true)
+            INSERT INTO repo_webhooks (repo_id, provider_webhook_id, secret, secret_hash, active, tenant_id)
+            VALUES ($1, $2, $3, $4, true, $5)
             RETURNING id
             "#,
         )
@@ -7125,10 +8907,15 @@ pub async fn register_repo_webhook(
         .bind(provider_webhook_id)
         .bind(&webhook_secret)
         .bind(&webhook_secret_hash)
-        .fetch_one(&state.pool)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "register_repo_webhook"))?
     };
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "register_repo_webhook_commit"))?;
 
     Ok(Json(RegisterRepoWebhookResponse {
         webhook_id,
@@ -7160,9 +8947,20 @@ pub async fn register_repo_webhook(
 )]
 pub async fn delete_repo_webhook(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(repo_id): Path<Uuid>,
     body: Option<Json<types::DeleteRepoWebhookRequest>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let tenant_id = extract_tenant_from_request(&state.pool, &headers).await?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_repo_webhook_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Load webhook + repo info so we can optionally delete the remote GitHub hook.
     let webhook = sqlx::query_as::<_, (Option<i64>, String, String, String)>(
         r#"
@@ -7177,7 +8975,7 @@ pub async fn delete_repo_webhook(
         "#,
     )
     .bind(repo_id)
-    .fetch_optional(&state.readonly_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_repo_webhook"))?
     .ok_or((StatusCode::NOT_FOUND, "Webhook not found".to_string()))?;
@@ -7242,7 +9040,7 @@ pub async fn delete_repo_webhook(
         "#,
     )
     .bind(repo_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "delete_repo_webhook"))?;
 
@@ -7250,6 +9048,10 @@ pub async fn delete_repo_webhook(
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Webhook not found".to_string()));
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "delete_repo_webhook_commit"))?;
 
     Ok(StatusCode::OK)
 }
@@ -7320,9 +9122,9 @@ pub async fn receive_github_webhook(
     // Find the webhook and its secret.
     // Prefer repo_id from callback URL query param; fall back to org/repo lookup.
     let webhook_info = if let Some(repo_id) = repo_id {
-        sqlx::query_as::<_, (Uuid, Uuid, Option<String>)>(
+        sqlx::query_as::<_, (Uuid, Uuid, Option<String>, Uuid)>(
             r#"
-            SELECT gw.id, gw.repo_id, gw.secret
+            SELECT gw.id, gw.repo_id, gw.secret, gw.tenant_id
             FROM repo_webhooks gw
             WHERE gw.repo_id = $1
             AND gw.deleted_at IS NULL AND gw.active = true
@@ -7333,9 +9135,9 @@ pub async fn receive_github_webhook(
         .await
         .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?
     } else {
-        sqlx::query_as::<_, (Uuid, Uuid, Option<String>)>(
+        sqlx::query_as::<_, (Uuid, Uuid, Option<String>, Uuid)>(
             r#"
-            SELECT gw.id, gw.repo_id, gw.secret
+            SELECT gw.id, gw.repo_id, gw.secret, gw.tenant_id
             FROM repo_webhooks gw
             JOIN repos r ON r.id = gw.repo_id
             WHERE LOWER(r.org) = LOWER($1) AND LOWER(r.repo) = LOWER($2)
@@ -7353,7 +9155,7 @@ pub async fn receive_github_webhook(
         "No webhook registered for this repo".to_string(),
     ))?;
 
-    let (webhook_id, _repo_id, webhook_secret) = webhook_info;
+    let (webhook_id, _repo_id, webhook_secret, tenant_id) = webhook_info;
     let webhook_secret = webhook_secret.ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "Webhook secret is not configured for this repo".to_string(),
@@ -7388,12 +9190,20 @@ pub async fn receive_github_webhook(
         ));
     }
 
+    // Start transaction and set tenant context for all subsequent queries
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "receive_github_webhook_begin"))?;
+    set_tenant_context(&mut tx, tenant_id).await?;
+
     // Create webhook event record
     let event_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO repo_webhook_events 
-        (webhook_id, delivery_id, event_type, ref, before_sha, after_sha, pusher)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        (webhook_id, delivery_id, event_type, ref, before_sha, after_sha, pusher, tenant_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id
         "#,
     )
@@ -7404,7 +9214,8 @@ pub async fn receive_github_webhook(
     .bind(&payload.before)
     .bind(&payload.after)
     .bind(&payload.pusher.name)
-    .fetch_one(&state.pool)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -7426,7 +9237,7 @@ pub async fn receive_github_webhook(
     .bind(org)
     .bind(repo_name)
     .bind(&branch)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -7497,7 +9308,7 @@ pub async fn receive_github_webhook(
                             )
                             .bind(namespace)
                             .bind(cluster)
-                            .fetch_optional(&state.readonly_pool)
+                            .fetch_optional(&mut *tx)
                             .await
                             .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -7591,7 +9402,7 @@ pub async fn receive_github_webhook(
         .bind(service_def_id)
         .bind(ns_id)
         .bind(&payload.after)
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *tx)
         .await
         .map(|rows| rows.len() as i64)
         .unwrap_or(0);
@@ -7620,7 +9431,7 @@ pub async fn receive_github_webhook(
         .bind(service_def_id)
         .bind(ns_id)
         .bind(&payload.after)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -7637,7 +9448,7 @@ pub async fn receive_github_webhook(
             .bind(is_directory)
             .bind(event_id)
             .bind(existing_id)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -7652,8 +9463,8 @@ pub async fn receive_github_webhook(
             sqlx::query_scalar::<_, Uuid>(
                 r#"
                 INSERT INTO service_versions 
-                (service_definition_id, namespace_id, version, git_sha, git_sha_short, path, is_directory_pattern, hash, source, webhook_event_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'webhook', $9)
+                (service_definition_id, namespace_id, version, git_sha, git_sha_short, path, is_directory_pattern, hash, source, webhook_event_id, tenant_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'webhook', $9, $10)
                 RETURNING id
                 "#,
             )
@@ -7666,7 +9477,8 @@ pub async fn receive_github_webhook(
             .bind(is_directory)
             .bind("pending") // Hash will be computed later when manifests are fetched
             .bind(event_id)
-            .fetch_one(&state.pool)
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?
         };
@@ -7696,7 +9508,7 @@ pub async fn receive_github_webhook(
     .bind(&matched_paths)
     .bind(&updated_versions)
     .bind(event_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -7707,9 +9519,14 @@ pub async fn receive_github_webhook(
         "#,
     )
     .bind(webhook_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
+
+    // Commit the transaction
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "receive_github_webhook_commit"))?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -8669,9 +10486,11 @@ mod path_template_tests {
 )]
 pub async fn get_webhook_events(
     State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     Path(repo_id): Path<Uuid>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<Vec<RepoWebhookEvent>>, (StatusCode, String)> {
+    let (mut tx, _tenant_id, _tenant_domain) = get_tenant_tx(&state.pool, &headers).await?;
     let pagination = pagination.validate();
 
     let events = sqlx::query_as::<_, RepoWebhookEvent>(
@@ -8700,9 +10519,12 @@ pub async fn get_webhook_events(
     .bind(repo_id)
     .bind(pagination.limit)
     .bind(pagination.offset)
-    .fetch_all(&state.readonly_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| sanitize_db_error(e, "get_webhook_events"))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| sanitize_db_error(e, "get_webhook_events_commit"))?;
     Ok(Json(events))
 }

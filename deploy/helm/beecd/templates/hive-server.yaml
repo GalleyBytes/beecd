@@ -40,14 +40,14 @@ spec:
         - secretRef:
             name: {{ .Values.hiveServer.database.hive.existingSecret | default (printf "%s-hive-db" (include "beecd.fullname" .)) }}
         - secretRef:
-            name: {{ .Values.hiveServer.github.existingSecret | default (printf "%s-github" (include "beecd.fullname" .)) }}
-        - secretRef:
-            name: {{ .Values.hiveServer.sops.existingSecret | default (printf "%s-sops" (include "beecd.fullname" .)) }}
-        - secretRef:
             name: {{ .Values.hiveServer.storage.existingSecret | default (printf "%s-storage" (include "beecd.fullname" .)) }}
         {{- if or .Values.hiveServer.jwt.existingSecret .Values.hiveServer.jwt.secretKey }}
         - secretRef:
             name: {{ .Values.hiveServer.jwt.existingSecret | default (printf "%s-jwt" (include "beecd.fullname" .)) }}
+        {{- end }}
+        {{- if or .Values.hiveServer.crypto.existingSecret .Values.hiveServer.crypto.encryptionKey .Values.hiveServer.crypto.bootstrapKey }}
+        - secretRef:
+            name: {{ .Values.hiveServer.crypto.existingSecret | default (printf "%s-crypto" (include "beecd.fullname" .)) }}
         {{- end }}
         resources:
           {{- toYaml .Values.hiveServer.resources | nindent 10 }}

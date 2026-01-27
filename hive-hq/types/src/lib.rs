@@ -552,6 +552,7 @@ pub struct DeleteId {
 #[cfg_attr(feature = "api", derive(sqlx::FromRow, utoipa::ToSchema))]
 pub struct Claim {
     pub email: String,
+    pub tenant_id: String,
     pub exp: usize,
     pub roles: Vec<String>,
 }

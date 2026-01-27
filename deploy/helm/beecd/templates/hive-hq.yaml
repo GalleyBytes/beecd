@@ -44,11 +44,15 @@ spec:
           value: {{ include "beecd.hiveHq.defaultAgentImage" . | quote }}
         envFrom:
         - secretRef:
-            name: {{ .Values.hiveServer.database.existingSecret | default (printf "%s-hive-db" (include "beecd.fullname" .)) }}
+            name: {{ .Values.hiveHq.database.existingSecret | default (printf "%s-hive-hq-db" (include "beecd.fullname" .)) }}
         - secretRef:
             name: {{ .Values.hiveHq.jwt.existingSecret | default (printf "%s-hive-hq" (include "beecd.fullname" .)) }}
         - secretRef:
             name: {{ .Values.hiveServer.storage.existingSecret | default (printf "%s-storage" (include "beecd.fullname" .)) }}
+        {{- if or .Values.hiveServer.crypto.existingSecret .Values.hiveServer.crypto.encryptionKey .Values.hiveServer.crypto.bootstrapKey }}
+        - secretRef:
+            name: {{ .Values.hiveServer.crypto.existingSecret | default (printf "%s-crypto" (include "beecd.fullname" .)) }}
+        {{- end }}
         resources:
           {{- toYaml .Values.hiveHq.resources | nindent 10 }}
         livenessProbe:
