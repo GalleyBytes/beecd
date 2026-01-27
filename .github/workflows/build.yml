@@ -19,6 +19,8 @@ jobs:
     outputs:
       skip_build: ${{ steps.check-commits.outputs.skip_build }}
       version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.image-tag.outputs.tag }}
+      latest_tag: ${{ steps.image-tag.outputs.latest_tag }}
       is_release: ${{ steps.check-event.outputs.is_release }}
       image_prefix: ${{ steps.lowercase.outputs.image_prefix }}
     steps:
@@ -115,6 +117,24 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
+      - name: Generate image tag
+        id: image-tag
+        run: |
+          VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          IS_RELEASE="${{ steps.check-event.outputs.is_release }}"
+
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            # Push to master: use version tag and latest
+            echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+            echo "latest_tag=latest" >> $GITHUB_OUTPUT
+          else
+            # PR: use version with timestamp suffix and latest-dev
+            TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "latest_tag=latest-dev" >> $GITHUB_OUTPUT
+          fi
+
       - name: Check version differs from master (PR only)
         if: github.event_name == 'pull_request'
         run: |
@@ -208,22 +228,12 @@ jobs:
       - name: Generate image tags
         id: tags
         run: |
-          VERSION="${{ needs.pre-checks.outputs.version }}"
-          IS_RELEASE="${{ needs.pre-checks.outputs.is_release }}"
+          IMAGE_TAG="${{ needs.pre-checks.outputs.image_tag }}"
+          LATEST_TAG="${{ needs.pre-checks.outputs.latest_tag }}"
           IMAGE="${{ needs.pre-checks.outputs.image_prefix }}/${{ matrix.image_name }}"
 
-          if [[ "$IS_RELEASE" == "true" ]]; then
-            # Push to master: use version tag and latest
-            echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest" >> $GITHUB_OUTPUT
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          else
-            # PR: use version with timestamp suffix
-            TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-            TAG="${VERSION}-${TIMESTAMP}-${SHORT_SHA}"
-            echo "tags=${IMAGE}:${TAG}" >> $GITHUB_OUTPUT
-            echo "version=${TAG}" >> $GITHUB_OUTPUT
-          fi
+          echo "tags=${IMAGE}:${IMAGE_TAG},${IMAGE}:${LATEST_TAG}" >> $GITHUB_OUTPUT
+          echo "version=${IMAGE_TAG}" >> $GITHUB_OUTPUT
 
       - name: Build and push
         uses: docker/build-push-action@v5
