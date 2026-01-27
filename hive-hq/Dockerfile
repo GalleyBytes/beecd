@@ -41,7 +41,7 @@ WORKDIR /usr/src
 RUN rustup target add x86_64-unknown-linux-musl
 
 # Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock* ./
 COPY agent/Cargo.toml agent/
 COPY diff/Cargo.toml diff/
 COPY hive/Cargo.toml hive/
