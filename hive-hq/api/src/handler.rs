@@ -18,12 +18,71 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::error;
 use types::*;
 use utoipa::ToSchema;
 
 use uuid::Uuid;
+
+/// Base domain for subdomain extraction (e.g., "beecd.example.com")
+/// When set, subdomains like "tenant1.beecd.example.com" will extract "tenant1" as the slug.
+/// When unset, falls back to extracting the first label (before the first dot).
+static BASE_DOMAIN: OnceLock<Option<String>> = OnceLock::new();
+
+fn get_base_domain() -> &'static Option<String> {
+    BASE_DOMAIN.get_or_init(|| {
+        std::env::var("BASE_DOMAIN").ok().map(|d| {
+            let d = d.trim().to_lowercase();
+            // Remove leading dot if present
+            if d.starts_with('.') {
+                d[1..].to_string()
+            } else {
+                d
+            }
+        })
+    })
+}
+
+/// Extract subdomain slug from a host string given a base domain.
+/// If base_domain is provided (e.g., "beecd.example.com"), strips it from the host
+/// to get the subdomain. Otherwise, takes the first label before the first dot.
+fn extract_subdomain_slug_with_base(host: &str, base_domain: Option<&str>) -> Option<String> {
+    // Remove port if present
+    let host_no_port = host.split(':').next().unwrap_or(host).to_lowercase();
+
+    if let Some(base) = base_domain {
+        let base = base.to_lowercase();
+        // If host ends with .base_domain, extract the prefix
+        if host_no_port.ends_with(&format!(".{}", base)) {
+            let prefix_len = host_no_port.len() - base.len() - 1; // -1 for the dot
+            let prefix = &host_no_port[..prefix_len];
+            // Get the rightmost label of the prefix (closest to base domain)
+            let slug = prefix.rsplit('.').next().unwrap_or(prefix);
+            if !slug.is_empty() {
+                return Some(slug.to_string());
+            }
+        }
+        // If host equals base_domain exactly, no subdomain
+        if host_no_port == base {
+            return None;
+        }
+    }
+
+    // Fallback: first label before the first dot
+    let slug = host_no_port.split('.').next().unwrap_or("");
+    if slug.is_empty() || slug == "localhost" {
+        None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+/// Extract subdomain slug from a host string using the global BASE_DOMAIN.
+fn extract_subdomain_slug(host: &str) -> Option<String> {
+    extract_subdomain_slug_with_base(host, get_base_domain().as_deref())
+}
 
 /// Extract tenant_id from Host header
 /// Looks up the domain in the tenants table and returns the tenant_id
@@ -32,9 +91,9 @@ async fn extract_tenant_from_request(
     headers: &axum::http::HeaderMap,
 ) -> Result<Uuid, (StatusCode, String)> {
     // Prefer X-Forwarded-Host when behind dev proxy; fall back to Host.
-    // If those are unusable (localhost), try Origin then Referer to recover the tenant subdomain.
+    // If those are unusable, try Origin then Referer to recover the tenant subdomain.
     let xf_host_name = axum::http::HeaderName::from_static("x-forwarded-host");
-    let mut host = headers
+    let host = headers
         .get(&xf_host_name)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
@@ -46,87 +105,60 @@ async fn extract_tenant_from_request(
         })
         .unwrap_or_else(|| "localhost".to_string());
 
-    // Extract slug from host (first label before the first dot)
-    let slug = host
-        .split(':')
-        .next()
-        .unwrap_or(&host)
-        .split('.')
-        .next()
-        .unwrap_or("");
+    // Try to extract slug from host using BASE_DOMAIN
+    let mut slug = extract_subdomain_slug(&host);
 
-    tracing::debug!("extract_tenant_from_request: host={}, slug={}", host, slug);
+    tracing::debug!(
+        "extract_tenant_from_request: host={}, slug={:?}, base_domain={:?}",
+        host,
+        slug,
+        get_base_domain()
+    );
 
-    if slug.is_empty() || slug == "localhost" || slug == "beecd" {
-        // Try Origin header to recover real host
-        if let Some(origin_val) = headers
+    // If no slug found, try Origin and Referer headers as fallback
+    if slug.is_none() {
+        let fallback_host = headers
             .get(axum::http::header::ORIGIN)
             .and_then(|h| h.to_str().ok())
-        {
-            // origin like: http://acme2.localhost:5173
-            let origin_host = origin_val
-                .split("//")
-                .nth(1)
-                .map(|s| s.split('/').next().unwrap_or(s))
-                .unwrap_or(origin_val);
-            host = origin_host.to_string();
-        } else if let Some(referer_val) = headers
-            .get(axum::http::header::REFERER)
-            .and_then(|h| h.to_str().ok())
-        {
-            let ref_host = referer_val
-                .split("//")
-                .nth(1)
-                .map(|s| s.split('/').next().unwrap_or(s))
-                .unwrap_or(referer_val);
-            host = ref_host.to_string();
-        }
+            .map(|origin_val| {
+                origin_val
+                    .split("//")
+                    .nth(1)
+                    .map(|s| s.split('/').next().unwrap_or(s))
+                    .unwrap_or(origin_val)
+                    .to_string()
+            })
+            .or_else(|| {
+                headers
+                    .get(axum::http::header::REFERER)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|referer_val| {
+                        referer_val
+                            .split("//")
+                            .nth(1)
+                            .map(|s| s.split('/').next().unwrap_or(s))
+                            .unwrap_or(referer_val)
+                            .to_string()
+                    })
+            });
 
-        let slug2 = host
-            .split(':')
-            .next()
-            .unwrap_or(&host)
-            .split('.')
-            .next()
-            .unwrap_or("");
-
-        if slug2.is_empty() || slug2 == "localhost" || slug2 == "beecd" {
-            tracing::warn!(
-                "Invalid slug from host (after origin/referer fallback): {}",
-                host
+        if let Some(fb_host) = fallback_host {
+            slug = extract_subdomain_slug(&fb_host);
+            tracing::debug!(
+                "extract_tenant_from_request: fallback host={}, slug={:?}",
+                fb_host,
+                slug
             );
-            return Err((
-                StatusCode::NOT_FOUND,
-                "No tenant subdomain found".to_string(),
-            ));
         }
-
-        // Use recovered slug
-        let result = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            SELECT id FROM tenants
-            WHERE domain = $1 AND status = 'active' AND deleted_at IS NULL
-            "#,
-        )
-        .bind(slug2)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to lookup tenant by slug {}: {:?}", slug2, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to resolve tenant".to_string(),
-            )
-        })?;
-
-        return result.ok_or_else(|| {
-            tracing::warn!("Tenant not found for slug: {}", slug2);
-            (
-                StatusCode::NOT_FOUND,
-                format!("Tenant not found for subdomain: {}", slug2),
-            )
-        });
     }
+
+    let slug = slug.ok_or_else(|| {
+        tracing::warn!("No tenant subdomain found in host: {}", host);
+        (
+            StatusCode::NOT_FOUND,
+            "No tenant subdomain found".to_string(),
+        )
+    })?;
 
     // Look up tenant by slug (domain column stores just the slug)
     let result = sqlx::query_scalar::<_, Uuid>(
@@ -135,7 +167,7 @@ async fn extract_tenant_from_request(
         WHERE domain = $1 AND status = 'active' AND deleted_at IS NULL
         "#,
     )
-    .bind(slug)
+    .bind(&slug)
     .fetch_optional(pool)
     .await
     .map_err(|e| {
@@ -466,6 +498,34 @@ pub async fn version(
     State(state): State<ServerState>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     Ok((StatusCode::OK, state.version))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AppConfigResponse {
+    /// API version
+    pub version: String,
+    /// Base domain for tenant subdomains (e.g., "beecd.example.com")
+    /// When set, tenant URLs are constructed as "{slug}.{base_domain}"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_domain: Option<String>,
+}
+
+/// Get public application configuration
+///
+/// Returns non-sensitive configuration values needed by the UI,
+/// including version and base domain for subdomain construction.
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    responses(
+        (status = 200, description = "Returns public app configuration", body = AppConfigResponse),
+    )
+)]
+pub async fn get_app_config(State(state): State<ServerState>) -> Json<AppConfigResponse> {
+    Json(AppConfigResponse {
+        version: state.version.clone(),
+        base_domain: get_base_domain().clone(),
+    })
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4672,6 +4732,93 @@ mod slug_tests {
         let slug = generate_domain_slug(&input);
         assert!(slug.len() <= 63);
         assert!(!slug.ends_with('-'));
+    }
+}
+
+#[cfg(test)]
+mod subdomain_extraction_tests {
+    use super::extract_subdomain_slug_with_base;
+
+    #[test]
+    fn test_with_base_domain_extracts_subdomain() {
+        let base = Some("beecd.example.com");
+        assert_eq!(
+            extract_subdomain_slug_with_base("tenant1.beecd.example.com", base),
+            Some("tenant1".to_string())
+        );
+        assert_eq!(
+            extract_subdomain_slug_with_base("acme-corp.beecd.example.com", base),
+            Some("acme-corp".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_base_domain_handles_port() {
+        let base = Some("beecd.example.com");
+        assert_eq!(
+            extract_subdomain_slug_with_base("tenant1.beecd.example.com:8080", base),
+            Some("tenant1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_base_domain_nested_subdomain() {
+        // If someone has extra levels like "www.tenant1.beecd.example.com",
+        // we extract the rightmost prefix label (closest to base domain)
+        let base = Some("beecd.example.com");
+        assert_eq!(
+            extract_subdomain_slug_with_base("www.tenant1.beecd.example.com", base),
+            Some("tenant1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_base_domain_exact_match_returns_none() {
+        let base = Some("beecd.example.com");
+        assert_eq!(
+            extract_subdomain_slug_with_base("beecd.example.com", base),
+            None
+        );
+    }
+
+    #[test]
+    fn test_with_base_domain_case_insensitive() {
+        let base = Some("beecd.example.com");
+        assert_eq!(
+            extract_subdomain_slug_with_base("TENANT1.BEECD.EXAMPLE.COM", base),
+            Some("tenant1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_without_base_domain_uses_first_label() {
+        assert_eq!(
+            extract_subdomain_slug_with_base("tenant1.beecd.example.com", None),
+            Some("tenant1".to_string())
+        );
+        assert_eq!(
+            extract_subdomain_slug_with_base("beecd.example.com", None),
+            Some("beecd".to_string()) // This is the problematic case BASE_DOMAIN fixes
+        );
+    }
+
+    #[test]
+    fn test_without_base_domain_localhost_returns_none() {
+        assert_eq!(extract_subdomain_slug_with_base("localhost", None), None);
+        assert_eq!(
+            extract_subdomain_slug_with_base("localhost:3000", None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_different_domain_with_base_falls_back() {
+        // If the host doesn't match the base domain, fall back to first label
+        let base = Some("beecd.example.com");
+        assert_eq!(
+            extract_subdomain_slug_with_base("tenant1.other.com", base),
+            Some("tenant1".to_string())
+        );
     }
 }
 

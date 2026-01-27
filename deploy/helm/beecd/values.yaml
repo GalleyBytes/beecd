@@ -263,6 +263,11 @@ hiveHq:
     axumPort: 8080
     dist: dist
 
+    # Base domain for subdomain extraction (e.g., "beecd.example.com").
+    # When set, tenant subdomains like "tenant1.beecd.example.com" will extract "tenant1" as the slug.
+    # When unset, falls back to extracting the first label (before the first dot).
+    baseDomain: ""
+
     # Preferred: explicit GitHub webhook callback URL.
     # This is the URL GitHub will POST to for webhook events.
     # Example:

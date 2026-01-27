@@ -34,6 +34,10 @@ spec:
           value: {{ .Values.hiveHq.env.axumPort | quote }}
         - name: DIST
           value: {{ .Values.hiveHq.env.dist | quote }}
+        {{- if .Values.hiveHq.env.baseDomain }}
+        - name: BASE_DOMAIN
+          value: {{ .Values.hiveHq.env.baseDomain | quote }}
+        {{- end }}
         {{- if .Values.hiveHq.env.githubWebhookCallbackUrl }}
         - name: GITHUB_WEBHOOK_CALLBACK_URL
           value: {{ .Values.hiveHq.env.githubWebhookCallbackUrl | quote }}

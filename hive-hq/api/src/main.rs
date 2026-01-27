@@ -388,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // build our application with a route
     let public_routes = Router::new()
         .route("/api/version", get(handler::version))
+        .route("/api/config", get(handler::get_app_config))
         .route("/api/auth/bootstrap", post(handler::ui_auth_bootstrap))
         .route(
             "/api/auth/bootstrap/status",

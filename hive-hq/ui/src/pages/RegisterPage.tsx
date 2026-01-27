@@ -2,12 +2,16 @@ import { useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import apiClient from '@/lib/api-client';
 import { ThemeToggle } from '@/components';
+import { useTenantUrl, useConfig } from '@/contexts/ConfigContext';
 
 export function RegisterPage() {
     const navigate = useNavigate();
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [success, setSuccess] = useState<string | null>(null);
+
+    const { loading: configLoading } = useConfig();
+    const getTenantUrl = useTenantUrl();
 
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
@@ -41,17 +45,13 @@ export function RegisterPage() {
 
             const domain = res.data?.domain;
             if (domain) {
-                // Extract slug from domain (e.g., "test.beecd.local" -> "test")
+                // Extract slug from domain (the domain from API is just the slug)
                 const slug = domain.split('.')[0];
-                setSuccess(`Tenant created! Redirecting to ${domain}...`);
+                setSuccess(`Tenant created! Redirecting...`);
 
-                // Redirect to tenant subdomain after brief delay
+                // Redirect to tenant subdomain after brief delay using configured base domain
                 setTimeout(() => {
-                    const protocol = window.location.protocol;
-                    const baseDomain = window.location.hostname;
-                    const port = window.location.port ? `:${window.location.port}` : '';
-                    // Reconstruct with tenant subdomain
-                    window.location.href = `${protocol}//${slug}.${baseDomain}${port}/`;
+                    window.location.href = getTenantUrl(slug, '/');
                 }, 2000);
             } else {
                 navigate('/login');
@@ -67,6 +67,15 @@ export function RegisterPage() {
             setLoading(false);
         }
     };
+
+    // Show loading while config is being fetched
+    if (configLoading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900">
+                <div className="text-gray-600 dark:text-gray-400">Loading...</div>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900 py-12 px-4 sm:px-6 lg:px-8">

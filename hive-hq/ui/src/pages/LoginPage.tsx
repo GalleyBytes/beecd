@@ -1,32 +1,21 @@
-import { useState, type FormEvent } from 'react';
+import { useState, type FormEvent, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import apiClient from '@/lib/api-client';
 import { ThemeToggle } from '@/components';
-
-// Check if we're on a tenant subdomain or base domain
-function getTenantFromHost(): string | null {
-    const host = window.location.hostname;
-    // Pattern: <tenant>.beecd.localhost or <tenant>.beecd.com etc
-    if (host.includes('.')) {
-        const parts = host.split('.');
-        // If more than 2 parts (e.g., tenant.beecd.localhost), first part is tenant
-        if (parts.length >= 3 || (parts.length === 2 && parts[0] !== 'beecd')) {
-            return parts[0];
-        }
-    }
-    return null; // Base domain (no tenant)
-}
+import { useCurrentTenant, useTenantUrl, useConfig } from '@/contexts/ConfigContext';
 
 export function LoginPage() {
     const navigate = useNavigate();
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    const tenantSlug = getTenantFromHost();
+    const { loading: configLoading } = useConfig();
+    const tenantSlug = useCurrentTenant();
+    const getTenantUrl = useTenantUrl();
     const isBaseDomain = tenantSlug === null;
 
-    // Two-step flow for base domain: first ask for tenant name
-    const [step] = useState<'tenant' | 'credentials'>(isBaseDomain ? 'tenant' : 'credentials');
+    // Derive step from isBaseDomain - recalculates when config loads
+    const step = useMemo(() => isBaseDomain ? 'tenant' : 'credentials', [isBaseDomain]);
     const [tenantName, setTenantName] = useState('');
 
     const [username, setUsername] = useState('');
@@ -46,11 +35,8 @@ export function LoginPage() {
                     setLoading(false);
                     return;
                 }
-                // Redirect to tenant subdomain
-                const protocol = window.location.protocol;
-                const baseDomain = window.location.hostname;
-                const port = window.location.port ? `:${window.location.port}` : '';
-                window.location.href = `${protocol}//${slug}.${baseDomain}${port}/login`;
+                // Redirect to tenant subdomain using configured base domain
+                window.location.href = getTenantUrl(slug, '/login');
                 return;
             }
 
@@ -71,6 +57,15 @@ export function LoginPage() {
             setLoading(false);
         }
     };
+
+    // Show loading while config is being fetched
+    if (configLoading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900">
+                <div className="text-gray-600 dark:text-gray-400">Loading...</div>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900 py-12 px-4 sm:px-6 lg:px-8">
