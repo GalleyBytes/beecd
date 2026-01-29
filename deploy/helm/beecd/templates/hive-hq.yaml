@@ -44,6 +44,10 @@ spec:
         {{- end }}
         - name: HIVE_DEFAULT_GRPC_SERVER
           value: {{ include "beecd.hiveHq.defaultGrpcServer" . | quote }}
+        {{- if .Values.hiveHq.env.hiveDefaultGrpcTls }}
+        - name: HIVE_DEFAULT_GRPC_TLS
+          value: {{ .Values.hiveHq.env.hiveDefaultGrpcTls | quote }}
+        {{- end }}
         - name: AGENT_DEFAULT_IMAGE
           value: {{ include "beecd.hiveHq.defaultAgentImage" . | quote }}
         envFrom:

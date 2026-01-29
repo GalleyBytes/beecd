@@ -280,8 +280,10 @@ hiveHq:
     # Both have sensible defaults computed from the chart if left empty.
     #
     # hiveDefaultGrpcServer: Defaults to {{ .Release.Name }}-hive-server.{{ .Release.Namespace }}.svc.cluster.local:5180
+    # hiveDefaultGrpcTls: Explicit TLS override. If not set, inferred from scheme (https:// = true, else false)
     # agentDefaultImage: Defaults to {{ image.registry }}/hive-agent:{{ image.tag }}
     hiveDefaultGrpcServer: ""
+    hiveDefaultGrpcTls: ""  # "true" or "false" to override, empty to infer from scheme
     agentDefaultImage: ""
     
   # JWT configuration

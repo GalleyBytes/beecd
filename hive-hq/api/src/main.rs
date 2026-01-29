@@ -4,6 +4,9 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -17,33 +20,13 @@ use utoipa_swagger_ui::SwaggerUi;
 mod handler;
 mod util;
 
+// Re-export ServerState from lib.rs (single source of truth)
+use api::ServerState;
+
 // const VERSION: Option<&'static str> = std::option_env!("API_VERSION");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_VERSION: Option<&str> = option_env!("BUILD_VERSION");
 static AGENT_MANIFEST_TEMPLATE: &str = include_str!("static/agent.tpl.yaml");
-
-#[derive(Clone)]
-pub struct ServerState {
-    pool: sqlx::Pool<sqlx::Postgres>,
-    readonly_pool: sqlx::Pool<sqlx::Postgres>,
-    agent_manifest_template: String,
-    agent_default_image: Option<String>,
-    hive_default_grpc_server: Option<String>,
-    version: String,
-    /// JWT secret bytes - either decoded from base64 or raw UTF-8 bytes
-    jwt_secret_bytes: Vec<u8>,
-    read_replica_wait_in_ms: u64,
-    github_webhook_callback_url: Option<String>,
-    /// In-memory, per-tenant encrypted secret cache. No DB persistence.
-    secret_cache: std::sync::Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<
-                (uuid::Uuid, String),
-                (Vec<u8>, Vec<u8>, i16, chrono::DateTime<chrono::Utc>),
-            >,
-        >,
-    >,
-}
 
 /// Decode JWT secret from string.
 /// Supports both base64-encoded secrets (e.g., from `openssl rand -base64 32`)
@@ -315,6 +298,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent_default_image = std::env::var("AGENT_DEFAULT_IMAGE").ok();
     let hive_default_grpc_server = std::env::var("HIVE_DEFAULT_GRPC_SERVER").ok();
+    let hive_default_grpc_tls =
+        std::env::var("HIVE_DEFAULT_GRPC_TLS")
+            .ok()
+            .and_then(|v| match v.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            });
     let github_webhook_callback_url = match std::env::var("GITHUB_WEBHOOK_CALLBACK_URL") {
         Ok(s) if !s.trim().is_empty() => match normalize_github_webhook_callback_url(&s) {
             Ok((normalized, changed)) => {
@@ -367,13 +358,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_manifest_template: String::from(AGENT_MANIFEST_TEMPLATE),
         agent_default_image,
         hive_default_grpc_server,
+        hive_default_grpc_tls,
         version: crate::BUILD_VERSION.map_or(crate::VERSION.to_string(), String::from),
         jwt_secret_bytes,
         read_replica_wait_in_ms: read_replica_wait_in_ms.parse().unwrap_or(75),
         github_webhook_callback_url,
-        secret_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
-            std::collections::HashMap::new(),
-        )),
+        secret_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new().allow_origin(Any);

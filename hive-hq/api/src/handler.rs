@@ -541,7 +541,8 @@ pub struct ClusterDefaultsResponse {
 /// Get default values for cluster creation/manifest generation.
 ///
 /// Values come from environment variables configured on the API:
-/// - HIVE_DEFAULT_GRPC_SERVER (may be scheme or host:port)
+/// - HIVE_DEFAULT_GRPC_SERVER (may include scheme or be host:port)
+/// - HIVE_DEFAULT_GRPC_TLS (explicit override: "true" or "false")
 /// - AGENT_DEFAULT_IMAGE
 #[utoipa::path(
     get,
@@ -556,7 +557,34 @@ pub struct ClusterDefaultsResponse {
 pub async fn get_cluster_defaults(
     State(state): State<ServerState>,
 ) -> Result<Json<ClusterDefaultsResponse>, (StatusCode, String)> {
-    let (grpc_address, grpc_tls) = match state.hive_default_grpc_server.clone() {
+    let (grpc_address, grpc_tls) = parse_grpc_server(
+        state.hive_default_grpc_server.as_deref(),
+        state.hive_default_grpc_tls,
+    );
+
+    Ok(Json(ClusterDefaultsResponse {
+        grpc_address,
+        grpc_tls,
+        agent_image: state.agent_default_image.clone(),
+    }))
+}
+
+/// Parse a gRPC server string into (address, tls) tuple.
+///
+/// The input may be:
+/// - A full URL with scheme: `https://grpc.example.com:443` or `http://grpc.example.com:5180`
+/// - A host:port without scheme: `grpc.example.com:443`
+///
+/// The `explicit_tls` parameter overrides TLS detection from the scheme.
+/// If not provided, TLS is inferred from the scheme (https = true, http = false),
+/// or defaults to false for host:port without scheme.
+///
+/// Returns (grpc_address as host:port, tls setting)
+fn parse_grpc_server(
+    raw: Option<&str>,
+    explicit_tls: Option<bool>,
+) -> (Option<String>, Option<bool>) {
+    match raw {
         None => (None, None),
         Some(raw) => {
             let trimmed = raw.trim().to_string();
@@ -567,24 +595,227 @@ pub async fn get_cluster_defaults(
                 if rest.is_empty() {
                     (None, None)
                 } else {
-                    let tls = scheme.eq_ignore_ascii_case("https");
+                    // Explicit TLS takes precedence over scheme
+                    let tls = explicit_tls.unwrap_or_else(|| scheme.eq_ignore_ascii_case("https"));
                     (Some(rest), Some(tls))
                 }
             } else {
-                // No scheme provided; default to plaintext for in-cluster addresses.
+                // No scheme provided; use explicit TLS setting or default to false for in-cluster
                 (
                     Some(trimmed.split('/').next().unwrap_or("").to_string()),
-                    Some(false),
+                    Some(explicit_tls.unwrap_or(false)),
                 )
             }
         }
-    };
+    }
+}
 
-    Ok(Json(ClusterDefaultsResponse {
-        grpc_address,
-        grpc_tls,
-        agent_image: state.agent_default_image.clone(),
-    }))
+#[cfg(test)]
+mod grpc_address_tests {
+    use super::parse_grpc_server;
+
+    // =========================================================================
+    // HTTPS scheme tests
+    // =========================================================================
+
+    #[test]
+    fn https_url_with_port_infers_tls_true() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:5180"), None);
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn https_url_standard_port_infers_tls_true() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:443"), None);
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn https_url_explicit_tls_false_overrides_scheme() {
+        // User explicitly sets TLS=false even with https:// scheme
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:5180"), Some(false));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn https_url_explicit_tls_true_confirms_scheme() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:443"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    // =========================================================================
+    // HTTP scheme tests
+    // =========================================================================
+
+    #[test]
+    fn http_url_with_port_infers_tls_false() {
+        let (addr, tls) = parse_grpc_server(Some("http://grpc.example.com:5180"), None);
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn http_url_explicit_tls_true_overrides_scheme() {
+        // User explicitly sets TLS=true even with http:// scheme (edge case)
+        let (addr, tls) = parse_grpc_server(Some("http://grpc.example.com:443"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    // =========================================================================
+    // No scheme (host:port only) tests
+    // =========================================================================
+
+    #[test]
+    fn hostport_only_defaults_tls_false() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:443"), None);
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn hostport_only_explicit_tls_true() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:5180"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn hostport_only_explicit_tls_false() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:5180"), Some(false));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn hostport_port_443_explicit_tls_true() {
+        // Port 443 is commonly TLS, but we need explicit setting without scheme
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:443"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    // =========================================================================
+    // Edge cases
+    // =========================================================================
+
+    #[test]
+    fn none_input_returns_none() {
+        let (addr, tls) = parse_grpc_server(None, None);
+        assert_eq!(addr, None);
+        assert_eq!(tls, None);
+    }
+
+    #[test]
+    fn empty_string_returns_none() {
+        let (addr, tls) = parse_grpc_server(Some(""), None);
+        assert_eq!(addr, None);
+        assert_eq!(tls, None);
+    }
+
+    #[test]
+    fn whitespace_only_returns_none() {
+        let (addr, tls) = parse_grpc_server(Some("   "), None);
+        assert_eq!(addr, None);
+        assert_eq!(tls, None);
+    }
+
+    #[test]
+    fn url_with_trailing_path_strips_path() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:443/path"), None);
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn url_with_trailing_slash_strips_slash() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:443/"), None);
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn scheme_only_no_host_returns_none() {
+        let (addr, tls) = parse_grpc_server(Some("https://"), None);
+        assert_eq!(addr, None);
+        assert_eq!(tls, None);
+    }
+
+    #[test]
+    fn leading_trailing_whitespace_trimmed() {
+        let (addr, tls) = parse_grpc_server(Some("  https://grpc.example.com:443  "), None);
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    // =========================================================================
+    // User's test matrix: tls=true explicit override
+    // =========================================================================
+
+    #[test]
+    fn matrix_tls_true_https_url_5180() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:5180"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn matrix_tls_true_https_url_443() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:443"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn matrix_tls_true_hostport_443() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:443"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    #[test]
+    fn matrix_tls_true_hostport_5180() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:5180"), Some(true));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(true));
+    }
+
+    // =========================================================================
+    // User's test matrix: tls=false explicit override
+    // =========================================================================
+
+    #[test]
+    fn matrix_tls_false_https_url_5180() {
+        // Even with https:// scheme, explicit tls=false overrides
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:5180"), Some(false));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn matrix_tls_false_https_url_443() {
+        let (addr, tls) = parse_grpc_server(Some("https://grpc.example.com:443"), Some(false));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn matrix_tls_false_hostport_443() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:443"), Some(false));
+        assert_eq!(addr, Some("grpc.example.com:443".to_string()));
+        assert_eq!(tls, Some(false));
+    }
+
+    #[test]
+    fn matrix_tls_false_hostport_5180() {
+        let (addr, tls) = parse_grpc_server(Some("grpc.example.com:5180"), Some(false));
+        assert_eq!(addr, Some("grpc.example.com:5180".to_string()));
+        assert_eq!(tls, Some(false));
+    }
 }
 
 #[cfg(feature = "dev-mode")]

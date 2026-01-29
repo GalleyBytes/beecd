@@ -155,9 +155,8 @@ impl TestEnvironment {
             agent_manifest_template: "test-template".to_string(),
             agent_default_image: Some("test-image:latest".to_string()),
             hive_default_grpc_server: Some("test-grpc:50051".to_string()),
+            hive_default_grpc_tls: Some(false),
             version: "test-1.0.0".to_string(),
-            gh_token: "test-token".to_string(),
-            github_api_url: "https://api.github.com".to_string(),
             jwt_secret_bytes: self.jwt_secret.clone().into_bytes(),
             read_replica_wait_in_ms: 0, // No wait for tests
             github_webhook_callback_url: None,
