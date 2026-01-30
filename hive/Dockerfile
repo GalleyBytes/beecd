@@ -5,13 +5,18 @@
 # Supports linux/amd64 and linux/arm64 using rust-musl-cross base images
 # =============================================================================
 
+# Declare TARGETARCH at the top level
+ARG TARGETARCH
+
 # Use different base images based on target architecture
 FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
 FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
 # Select the appropriate builder based on TARGETARCH
-ARG TARGETARCH
 FROM builder-${TARGETARCH} AS builder
+
+# Redeclare ARG after FROM
+ARG TARGETARCH
 
 # Install protobuf compiler and update CA certificates
 RUN apt-get update && \
@@ -38,18 +43,15 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
   mkdir -p hive-hq/api/src && echo 'fn main() {}' > hive-hq/api/src/main.rs && touch hive-hq/api/src/lib.rs && \
   mkdir -p storage/src && touch storage/src/lib.rs
 
-# Determine Rust target based on architecture
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-        echo "aarch64-unknown-linux-musl" > /rust-target; \
-    else \
-        echo "x86_64-unknown-linux-musl" > /rust-target; \
-    fi
-
-# Pre-build dependencies with cache mounts
-RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry \
-  --mount=type=cache,target=/root/.cargo/git,id=cargo-git \
-  --mount=type=cache,target=/usr/src/target,id=beecd-target \
-  export RUST_TARGET=$(cat /rust-target) && \
+# Pre-build dependencies with architecture-specific cache mounts
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
+  --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
+  --mount=type=cache,target=/usr/src/target,id=beecd-target-${TARGETARCH} \
+  if [ "$TARGETARCH" = "arm64" ]; then \
+      RUST_TARGET="aarch64-unknown-linux-musl"; \
+  else \
+      RUST_TARGET="x86_64-unknown-linux-musl"; \
+  fi && \
   cargo build --release --target $RUST_TARGET -p hive 2>/dev/null || true
 
 # Copy real source files
@@ -66,7 +68,11 @@ ARG BUILD_VERSION
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 # Build final binary
-RUN export RUST_TARGET=$(cat /rust-target) && \
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      RUST_TARGET="aarch64-unknown-linux-musl"; \
+  else \
+      RUST_TARGET="x86_64-unknown-linux-musl"; \
+  fi && \
   cargo build --release --target $RUST_TARGET -p hive && \
   cp /usr/src/target/$RUST_TARGET/release/hive /usr/local/bin/hive
 

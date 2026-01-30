@@ -2,7 +2,7 @@
 # =============================================================================
 # Docker Build Script for beecd services
 # =============================================================================
-# Uses Docker BuildKit with cross-compilation for linux/amd64 images
+# Uses Docker BuildKit with cross-compilation for linux/amd64 and linux/arm64
 #
 # Usage:
 #   ./build.sh agent                    # Build agent only

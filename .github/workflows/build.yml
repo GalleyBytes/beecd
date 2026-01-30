@@ -81,4 +81,5 @@ jobs:
           cache-to: type=gha,mode=max
       
       - name: Image digest
-        run: echo ${{ steps.meta.outputs.digest }}
+        if: github.event_name != 'pull_request'
+        run: echo "Image digest:${{ steps.meta.outputs.digest }}"
