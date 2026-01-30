@@ -43,10 +43,6 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
     mkdir -p diff/src && touch diff/src/lib.rs && \
     mkdir -p storage/src && touch storage/src/lib.rs
 
-# Set Rust target as environment variable based on architecture
-ENV RUST_TARGET=${TARGETARCH:+$(test "$TARGETARCH" = "arm64" && echo "aarch64-unknown-linux-musl" || echo "x86_64-unknown-linux-musl")}
-RUN echo "Building for architecture: $TARGETARCH, target: $RUST_TARGET"
-
 # Build dependencies with architecture-specific cache mounts
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
