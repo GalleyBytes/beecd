@@ -215,6 +215,9 @@ pub struct Agent {
             GrpcHeaderInjector,
         >,
     >,
+    /// Unauthenticated gRPC client for auth operations (Login, RefreshToken, Logout)
+    /// Using the regular grpc_client for these would inject expired tokens, causing auth loops
+    pub grpc_auth_client: WorkerClient<tonic::transport::Channel>,
     pub k8s_client: Client,
     pub discovery: Discovery,
     pub owner: String,
@@ -2652,6 +2655,7 @@ impl Agent {
                 GrpcHeaderInjector,
             >,
         >,
+        grpc_auth_client: WorkerClient<tonic::transport::Channel>,
         k8s_client: Client,
         owner_name: String,
         cluster_name: String,
@@ -2698,6 +2702,7 @@ impl Agent {
         drop(_enter);
         Ok(Self {
             grpc_client,
+            grpc_auth_client,
             k8s_client,
             discovery,
             owner: owner_name,
@@ -2734,7 +2739,7 @@ impl Agent {
 
         debug!("Refreshing access token");
         let response = self
-            .grpc_client
+            .grpc_auth_client
             .clone()
             .refresh_token(beecd::RefreshTokenRequest {
                 refresh_token: refresh_token_value,
@@ -2770,7 +2775,7 @@ impl Agent {
         info!("Re-authenticating with server");
 
         let response = self
-            .grpc_client
+            .grpc_auth_client
             .clone()
             .login(beecd::LoginRequest {
                 username: self.cluster_name.clone(),
