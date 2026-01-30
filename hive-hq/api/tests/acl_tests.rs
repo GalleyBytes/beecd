@@ -7,11 +7,12 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 use types::Claim;
+use uuid::Uuid;
 
 // Tests must run serially to avoid port-forward conflicts
 // Run with: cargo test --test acl_tests -- --ignored --nocapture --test-threads=1
 
-fn generate_test_jwt(jwt_secret: &str, roles: Vec<String>) -> String {
+fn generate_test_jwt(jwt_secret: &str, roles: Vec<String>, tenant_id: Uuid) -> String {
     let secret_bytes = jwt_secret.as_bytes();
 
     let expiration =
@@ -21,6 +22,7 @@ fn generate_test_jwt(jwt_secret: &str, roles: Vec<String>) -> String {
         email: "test@galleybytes.com".to_string(),
         exp: expiration.as_secs() as usize,
         roles,
+        tenant_id: tenant_id.to_string(),
     };
 
     encode(
@@ -95,7 +97,7 @@ async fn test_aversion_endpoint_requires_role() {
     let app = env.create_test_app();
 
     // Create token without aversion role
-    let token = generate_test_jwt(&env.jwt_secret, vec!["some-other-role".to_string()]);
+    let token = generate_test_jwt(&env.jwt_secret, vec!["some-other-role".to_string()], env.tenant_id);
 
     let request = Request::builder()
         .uri("/api/aversion/clusters/test-cluster/namespaces")
@@ -122,7 +124,7 @@ async fn test_aversion_endpoint_accepts_aversion_role() {
     let app = env.create_test_app();
 
     // Create token with aversion role
-    let token = generate_test_jwt(&env.jwt_secret, vec!["aversion".to_string()]);
+    let token = generate_test_jwt(&env.jwt_secret, vec!["aversion".to_string()], env.tenant_id);
 
     let request = Request::builder()
         .uri("/api/aversion/clusters/test-cluster/namespaces")
@@ -150,7 +152,7 @@ async fn test_aversion_endpoint_accepts_admin_role() {
     let app = env.create_test_app();
 
     // Create token with admin role
-    let token = generate_test_jwt(&env.jwt_secret, vec!["admin".to_string()]);
+    let token = generate_test_jwt(&env.jwt_secret, vec!["admin".to_string()], env.tenant_id);
 
     let request = Request::builder()
         .uri("/api/aversion/clusters/test-cluster/namespaces")
@@ -178,7 +180,7 @@ async fn test_admin_role_accesses_protected_endpoints() {
     let app = env.create_test_app();
 
     // Create token with admin role
-    let token = generate_test_jwt(&env.jwt_secret, vec!["admin".to_string()]);
+    let token = generate_test_jwt(&env.jwt_secret, vec!["admin".to_string()], env.tenant_id);
 
     let request = Request::builder()
         .uri("/api/clusters")
@@ -205,7 +207,7 @@ async fn test_aversion_role_accesses_protected_endpoints() {
     let app = env.create_test_app();
 
     // Create token with aversion role
-    let token = generate_test_jwt(&env.jwt_secret, vec!["aversion".to_string()]);
+    let token = generate_test_jwt(&env.jwt_secret, vec!["aversion".to_string()], env.tenant_id);
 
     let request = Request::builder()
         .uri("/api/clusters")
@@ -235,6 +237,7 @@ async fn test_multiple_roles() {
     let token = generate_test_jwt(
         &env.jwt_secret,
         vec!["admin".to_string(), "aversion".to_string()],
+        env.tenant_id,
     );
 
     let request = Request::builder()

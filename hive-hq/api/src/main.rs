@@ -4,6 +4,9 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -17,24 +20,13 @@ use utoipa_swagger_ui::SwaggerUi;
 mod handler;
 mod util;
 
+// Re-export ServerState from lib.rs (single source of truth)
+use api::ServerState;
+
 // const VERSION: Option<&'static str> = std::option_env!("API_VERSION");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_VERSION: Option<&str> = option_env!("BUILD_VERSION");
 static AGENT_MANIFEST_TEMPLATE: &str = include_str!("static/agent.tpl.yaml");
-
-#[derive(Clone)]
-pub struct ServerState {
-    pool: sqlx::Pool<sqlx::Postgres>,
-    readonly_pool: sqlx::Pool<sqlx::Postgres>,
-    agent_manifest_template: String,
-    agent_default_image: Option<String>,
-    hive_default_grpc_server: Option<String>,
-    version: String,
-    /// JWT secret bytes - either decoded from base64 or raw UTF-8 bytes
-    jwt_secret_bytes: Vec<u8>,
-    read_replica_wait_in_ms: u64,
-    github_webhook_callback_url: Option<String>,
-}
 
 /// Decode JWT secret from string.
 /// Supports both base64-encoded secrets (e.g., from `openssl rand -base64 32`)
@@ -306,6 +298,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent_default_image = std::env::var("AGENT_DEFAULT_IMAGE").ok();
     let hive_default_grpc_server = std::env::var("HIVE_DEFAULT_GRPC_SERVER").ok();
+    let hive_default_grpc_tls =
+        std::env::var("HIVE_DEFAULT_GRPC_TLS")
+            .ok()
+            .and_then(|v| match v.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            });
     let github_webhook_callback_url = match std::env::var("GITHUB_WEBHOOK_CALLBACK_URL") {
         Ok(s) if !s.trim().is_empty() => match normalize_github_webhook_callback_url(&s) {
             Ok((normalized, changed)) => {
@@ -358,10 +358,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_manifest_template: String::from(AGENT_MANIFEST_TEMPLATE),
         agent_default_image,
         hive_default_grpc_server,
+        hive_default_grpc_tls,
         version: crate::BUILD_VERSION.map_or(crate::VERSION.to_string(), String::from),
         jwt_secret_bytes,
         read_replica_wait_in_ms: read_replica_wait_in_ms.parse().unwrap_or(75),
         github_webhook_callback_url,
+        secret_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -376,12 +378,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // build our application with a route
     let public_routes = Router::new()
         .route("/api/version", get(handler::version))
+        .route("/api/config", get(handler::get_app_config))
         .route("/api/auth/bootstrap", post(handler::ui_auth_bootstrap))
         .route(
             "/api/auth/bootstrap/status",
             get(handler::ui_auth_bootstrap_status),
         )
-        .route("/api/auth/login", post(handler::ui_auth_login));
+        .route("/api/auth/login", post(handler::ui_auth_login))
+        .route("/api/tenants/register", post(handler::register_tenant))
+        // temporary alias to handle environments that double-prefix /api
+        .route("/api/api/tenants/register", post(handler::register_tenant));
 
     #[cfg(feature = "dev-mode")]
     let public_routes = public_routes.route("/api/free-token", get(handler::free_token));
@@ -411,6 +417,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(cors)
         .route("/api/auth/me", get(handler::ui_auth_me))
         .route("/api/auth/logout", post(handler::ui_auth_logout))
+        .route(
+            "/api/secrets",
+            get(handler::list_secrets).post(handler::create_secret),
+        )
+        .route("/api/secrets/{purpose}", delete(handler::delete_secret))
+        .route(
+            "/api/secrets/{purpose}/encrypted",
+            get(handler::get_encrypted_secret),
+        )
         .route("/api/cluster-defaults", get(handler::get_cluster_defaults))
         .route(
             "/api/clusters",

@@ -28,15 +28,50 @@ postgresql:
       size: 10Gi
     initdb:
       scripts:
-        init.sql: |
+        # Two-role pattern for RLS:
+        # - hive_admin: owns tables, runs migrations, bypasses RLS  
+        # - hive_user: app connection role, subject to RLS (non-owner)
+        #
+        # This script creates roles and the database. The full schema migration
+        # (00000000000000_init.sql) must be applied separately:
+        #
+        #   kubectl exec -it <postgres-pod> -- psql -U postgres -d hive -f /path/to/init.sql
+        #
+        # Or via a Kubernetes Job before deploying the application.
+        # The migration grants DML privileges to hive_user/hq_user at the end.
+        00-init-roles.sql: |
+          -- Create hive database
           CREATE DATABASE hive;
+          
+          -- hive_admin: owns tables and SECURITY DEFINER functions
+          -- BYPASSRLS allows SECURITY DEFINER functions to bypass RLS
+          -- Used for migrations, admin tasks, bypasses RLS
+          CREATE USER hive_admin WITH PASSWORD 'hive-admin-password' BYPASSRLS;
+          GRANT ALL PRIVILEGES ON DATABASE hive TO hive_admin;
+          
+          -- hive_user: app connection role, subject to RLS (non-owner)
+          -- Used by hive-server and hive-hq application connections
           CREATE USER hive_user WITH PASSWORD 'hive-password';
-          GRANT ALL PRIVILEGES ON DATABASE hive TO hive_user;
+          GRANT CONNECT ON DATABASE hive TO hive_user;
+          
+          -- hq_user: same as hive_user (used by hive-hq API)
+          CREATE USER hq_user WITH PASSWORD 'hq-password';
+          GRANT CONNECT ON DATABASE hive TO hq_user;
+          
+          -- Allow admin to act as app user for testing
+          GRANT hive_user TO hive_admin;
+          GRANT hq_user TO hive_admin;
+          
           \c hive
           CREATE EXTENSION IF NOT EXISTS pgcrypto;
-          GRANT ALL ON SCHEMA public TO hive_user;
-          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO hive_user;
-          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO hive_user;
+          
+          -- hive_admin owns the schema
+          GRANT ALL ON SCHEMA public TO hive_admin;
+          ALTER SCHEMA public OWNER TO hive_admin;
+          
+          -- App users get basic schema access (DML grants come from migration)
+          GRANT USAGE ON SCHEMA public TO hive_user;
+          GRANT USAGE ON SCHEMA public TO hq_user;
 
 # MinIO subchart configuration
 # Enable to deploy MinIO with the chart
@@ -83,7 +118,55 @@ hiveServer:
     grpcTimeout: 30
     grpcKeepAlive: 20
     
+  # Hive Server configuration
+hiveServer:
+  enabled: true
+  replicaCount: 1
+  
+  image:
+    repository: hive-server
+    tag: ""  # Optional: override image tag for this component
+    
+  service:
+    type: ClusterIP
+    port: 5180
+    
+  resources: {}
+    # limits:
+    #   cpu: 500m
+    #   memory: 512Mi
+    # requests:
+    #   cpu: 250m
+    #   memory: 256Mi
+    
+  env:
+    logLevel: info
+    storageType: s3
+    grpcTimeout: 30
+    grpcKeepAlive: 20
+    
+  # Crypto configuration for multi-tenant secret encryption
+  crypto:
+    # Bootstrap key: 32-byte random key (base64-encoded) used to derive per-tenant encryption keys
+    # Generate with: openssl rand -base64 32
+    # WARNING: This is the master key for all tenant secret decryption - protect it carefully
+    # RECOMMENDED: Use existingSecret to load from Kubernetes Secret instead of hardcoding
+    bootstrapKey: ""  # Use existingSecret for production
+    
+    # Use existing Kubernetes secret to load the bootstrap key
+    # Secret must contain: HIVE_CRYPTO_ROOT_KEY
+    # Create with: kubectl create secret generic hive-crypto-bootstrap \
+    #              --from-literal=HIVE_CRYPTO_ROOT_KEY="$(openssl rand -base64 32)"
+    existingSecret: ""  # Name of secret containing HIVE_CRYPTO_ROOT_KEY
+    
   # Database configuration - REQUIRED (auto-configured if postgresql.enabled=true)
+  # 
+  # Two-role pattern for Row-Level Security:
+  #   - hive_admin: owns tables, runs migrations, bypasses RLS
+  #   - hive_user: app connection role, subject to RLS (non-owner)
+  #
+  # The application (hive-server, hive-hq) connects as hive_user.
+  # Migrations must be run separately as hive_admin or postgres superuser.
   database:
     # Hive database (single database for all BeeCD data)
     hive:
@@ -92,14 +175,23 @@ hiveServer:
       hostRo: ""  # Optional read-only replica, defaults to host if empty
       port: 5432
       name: hive
+      # Application user (subject to RLS - non-owner)
       user: hive_user
       password: "hive-password"  # Use existingSecret instead for production
       existingSecret: ""  # Name of existing secret containing DATABASE_HOST, DATABASE_PASSWORD, etc.
     
-  # GitHub configuration - REQUIRED
+    # Admin user for running migrations (bypasses RLS - table owner)
+    # Only needed if running migrations separately from PostgreSQL initdb
+    admin:
+      user: hive_admin
+      password: "hive-admin-password"  # Use existingSecret for production
+      existingSecret: ""  # Secret containing ADMIN_DATABASE_USER, ADMIN_DATABASE_PASSWORD
+    
+  # GitHub configuration - OPTIONAL (for legacy repo access)
+  # In multi-tenant mode, GitHub tokens are configured per-tenant via the UI
   github:
-    user: ""
-    token: ""  # Personal Access Token with repo scope
+    user: ""  # Optional: for legacy single-tenant mode or backward compatibility
+    token: ""  # Optional: Personal Access Token with repo scope
     apiUrl: ""  # Optional: for GitHub Enterprise
     existingSecret: ""  # Use existing secret instead
     
@@ -121,10 +213,11 @@ hiveServer:
     #              --from-literal=JWT_SECRET_KEY="$(openssl rand -base64 48)"
     existingSecret: ""
     
-  # SOPS/GPG configuration - REQUIRED for encrypted secrets
+  # SOPS/GPG configuration - OPTIONAL (for legacy single-tenant mode)
+  # In multi-tenant mode, GPG keys are configured per-tenant via the UI
   sops:
-    fingerprint: ""
-    gpgKey: ""  # Base64-encoded GPG private key
+    fingerprint: ""  # Optional: GPG key fingerprint
+    gpgKey: ""  # Optional: Base64-encoded GPG private key
     existingSecret: ""  # Use existing secret instead
     
   # Storage configuration (S3 or MinIO) - REQUIRED (auto-configured if minio.enabled=true)
@@ -170,6 +263,11 @@ hiveHq:
     axumPort: 8080
     dist: dist
 
+    # Base domain for subdomain extraction (e.g., "beecd.example.com").
+    # When set, tenant subdomains like "tenant1.beecd.example.com" will extract "tenant1" as the slug.
+    # When unset, falls back to extracting the first label (before the first dot).
+    baseDomain: ""
+
     # Preferred: explicit GitHub webhook callback URL.
     # This is the URL GitHub will POST to for webhook events.
     # Example:
@@ -182,8 +280,10 @@ hiveHq:
     # Both have sensible defaults computed from the chart if left empty.
     #
     # hiveDefaultGrpcServer: Defaults to {{ .Release.Name }}-hive-server.{{ .Release.Namespace }}.svc.cluster.local:5180
+    # hiveDefaultGrpcTls: Explicit TLS override. If not set, inferred from scheme (https:// = true, else false)
     # agentDefaultImage: Defaults to {{ image.registry }}/hive-agent:{{ image.tag }}
     hiveDefaultGrpcServer: ""
+    hiveDefaultGrpcTls: ""  # "true" or "false" to override, empty to infer from scheme
     agentDefaultImage: ""
     
   # JWT configuration
@@ -191,7 +291,17 @@ hiveHq:
     secret: ""  # Auto-generated if not provided
     existingSecret: ""  # Use existing secret instead
     
-  # Uses hiveServer.database.hive configuration
+  # Database configuration for hive-hq (uses hq_user, subject to RLS)
+  database:
+    # Leave empty to use embedded PostgreSQL (when postgresql.enabled=true)
+    host: ""  # Will default to {{ .Release.Name }}-postgresql if postgresql.enabled
+    hostRo: ""  # Optional read-only replica, defaults to host if empty
+    port: 5432
+    name: hive
+    # hq_user: app connection role, subject to RLS (non-owner)
+    user: hq_user
+    password: "hq-password"  # Use existingSecret instead for production
+    existingSecret: ""  # Name of existing secret containing DATABASE_HOST, DATABASE_PASSWORD, etc.
   
   # Ingress configuration
   ingress:

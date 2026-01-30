@@ -1,5 +1,4 @@
 /target
 .vscode
-Cargo.lock
 /src/main.rs
 /tests/output/

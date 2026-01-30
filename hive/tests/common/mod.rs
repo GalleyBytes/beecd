@@ -3,6 +3,10 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::env;
+use uuid::Uuid;
+
+/// Test tenant ID for isolation. Created during first test run.
+pub static TEST_TENANT_ID: std::sync::LazyLock<Uuid> = std::sync::LazyLock::new(Uuid::new_v4);
 
 /// Set up a test database pool for integration tests.
 ///
@@ -18,11 +22,33 @@ pub async fn setup_test_db() -> PgPool {
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set for integration tests. Run with: make test-integration");
 
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await
-        .expect("Failed to connect to test database")
+        .expect("Failed to connect to test database");
+
+    // Ensure test tenant exists (insert or do nothing - tests share the same tenant)
+    let tenant_subdomain = format!("hive-test-{}", &TEST_TENANT_ID.to_string()[..8]);
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO tenants (id, name, domain)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(*TEST_TENANT_ID)
+    .bind(&format!("Hive Test Tenant {}", tenant_subdomain))
+    .bind(&tenant_subdomain)
+    .execute(&pool)
+    .await;
+
+    pool
+}
+
+/// Get the test tenant ID
+pub fn get_test_tenant_id() -> Uuid {
+    *TEST_TENANT_ID
 }
 
 /// Clean up test data after each test run.
@@ -44,24 +70,26 @@ pub async fn cleanup_test_data(pool: &PgPool, cluster_name: &str) {
 }
 
 /// Helper to create a test cluster in the database
-pub async fn create_test_cluster(pool: &PgPool, name: &str) -> uuid::Uuid {
-    sqlx::query_scalar::<_, uuid::Uuid>(
-        "INSERT INTO clusters (name, metadata) VALUES ($1, $2) RETURNING id",
+pub async fn create_test_cluster(pool: &PgPool, name: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO clusters (name, metadata, tenant_id) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(name)
     .bind("{}")
+    .bind(*TEST_TENANT_ID)
     .fetch_one(pool)
     .await
     .expect("Failed to create test cluster")
 }
 
 /// Helper to create a test user in the database
-pub async fn create_test_user(pool: &PgPool, name: &str, password_hash: &str) -> uuid::Uuid {
-    sqlx::query_scalar::<_, uuid::Uuid>(
-        "INSERT INTO users (name, hash) VALUES ($1, $2) RETURNING id",
+pub async fn create_test_user(pool: &PgPool, name: &str, password_hash: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO users (name, hash, tenant_id) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(name)
     .bind(password_hash)
+    .bind(*TEST_TENANT_ID)
     .fetch_one(pool)
     .await
     .expect("Failed to create test user")

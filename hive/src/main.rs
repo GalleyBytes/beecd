@@ -22,6 +22,55 @@ use yaml_rust::YamlLoader;
 
 mod auth;
 
+/// Crypto module for secret decryption (hive-server only decrypts, never encrypts)
+mod crypto {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::Engine;
+
+    const NONCE_SIZE: usize = 12;
+
+    /// Decrypt ciphertext using AES-256-GCM
+    pub fn decrypt(key: &[u8; 32], ciphertext: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+        if key.len() != 32 {
+            return Err("Key must be 32 bytes".to_string());
+        }
+
+        if iv.len() != NONCE_SIZE {
+            return Err(format!("IV must be {} bytes", NONCE_SIZE));
+        }
+
+        let cipher = Aes256Gcm::new(key.into());
+        let nonce = Nonce::from_slice(iv);
+
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Decryption failed: {}", e))
+    }
+
+    /// Get the encryption key from environment variable
+    /// Expects ENCRYPTION_KEY to be base64-encoded 32-byte key
+    pub fn get_encryption_key() -> Result<[u8; 32], String> {
+        let key_b64 = std::env::var("ENCRYPTION_KEY")
+            .map_err(|_| "ENCRYPTION_KEY environment variable not set".to_string())?;
+
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(key_b64.trim())
+            .map_err(|e| format!("Failed to decode ENCRYPTION_KEY: {}", e))?;
+
+        if key_bytes.len() != 32 {
+            return Err(format!(
+                "ENCRYPTION_KEY must be 32 bytes (got {})",
+                key_bytes.len()
+            ));
+        }
+
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(&key_bytes);
+        Ok(key_array)
+    }
+}
+
 pub mod beecd {
     tonic::include_proto!("beecd");
 }
@@ -137,14 +186,16 @@ struct ReleaseRow {
 // JWT Authentication query result structs
 #[derive(sqlx::FromRow)]
 struct UserAuthRow {
-    id: Uuid,
-    hash: String,
+    user_id: Uuid,
+    tenant_id: Uuid,
+    password_hash: String,
 }
 
 #[derive(sqlx::FromRow)]
 struct RefreshTokenRow {
-    id: Uuid,
+    token_id: Uuid,
     user_id: Uuid,
+    tenant_id: Uuid,
     cluster_id: Option<Uuid>,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
@@ -153,23 +204,20 @@ struct RefreshTokenRow {
     username: String,
 }
 
-async fn save_hive_err_to_db(cluster_id: &Uuid, message: &str, db: &sqlx::Pool<sqlx::Postgres>) {
-    match sqlx::query(
-        r#"
-            INSERT INTO hive_errors
-                (cluster_id, message)
-            values
-                ($1, $2)
-            ON CONFLICT
-                (cluster_id, message)
-            DO
-                UPDATE SET deprecated_at = NULL;
-        "#,
-    )
-    .bind(cluster_id)
-    .bind(message)
-    .execute(db)
-    .await
+/// Log a hive error to the database using SECURITY DEFINER function.
+/// This bypasses RLS and can be called outside of a tenant transaction.
+async fn save_hive_err_to_db(
+    tenant_id: Uuid,
+    cluster_id: &Uuid,
+    message: &str,
+    db: &sqlx::Pool<sqlx::Postgres>,
+) {
+    match sqlx::query("SELECT log_hive_error($1, $2, $3)")
+        .bind(tenant_id)
+        .bind(cluster_id)
+        .bind(message)
+        .execute(db)
+        .await
     {
         Ok(_) => {}
         Err(e) => {
@@ -182,24 +230,59 @@ async fn read_content(
     url_query_params: &str,
     base_url: &str,
     content: &mut Vec<u8>,
+    github_token: Option<&str>,
+    tenant_domain: &str,
 ) -> Result<(), HiveError> {
     let url = format!("{}{}", base_url, url_query_params);
-    debug!("Fetching content from URL: {}", url);
-    let json_response = fetch_data(&url).await;
+    debug!("[tenant:{}] Fetching content from URL: {}", tenant_domain, url);
+    let json_response = fetch_data(&url, github_token).await;
     let raw_data = match json_response {
         Ok(data) => {
             debug!("GitHub API response: {:?}", data);
-            match data.get("download_url") {
-                Some(download_url) => match download_raw_data(download_url.as_str().unwrap()).await
-                {
-                    Ok(raw_data) => raw_data,
-                    Err(e) => {
-                        error!("Failed to download raw data from {}: {}", download_url, e);
-                        return Err(HiveError::FetchError(e));
+
+            // Check if this is a directory listing (array response)
+            if data.is_array() {
+                debug!("Response is an array (directory listing), processing all files");
+                if let Some(files) = data.as_array() {
+                    for file in files {
+                        if let Some(file_type) = file.get("type").and_then(|t| t.as_str()) {
+                            if file_type == "file" {
+                                if let Some(download_url) =
+                                    file.get("download_url").and_then(|u| u.as_str())
+                                {
+                                    match download_raw_data(download_url, github_token).await {
+                                        Ok(file_data) => {
+                                            content.append(&mut "\n---\n".as_bytes().to_vec());
+                                            content.append(&mut file_data.as_bytes().to_vec());
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to download file from {}: {}",
+                                                download_url, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                },
+                }
+                return Ok(());
+            }
+
+            // Single file response
+            match data.get("download_url") {
+                Some(download_url) => {
+                    match download_raw_data(download_url.as_str().unwrap(), github_token).await {
+                        Ok(raw_data) => raw_data,
+                        Err(e) => {
+                            error!("Failed to download raw data from {}: {}", download_url, e);
+                            return Err(HiveError::FetchError(e));
+                        }
+                    }
+                }
                 None => {
-                    // Check if this is a directory response (has "type": "dir")
+                    // Check if this is an error response
                     if let Some(error_msg) = data.get("message") {
                         error!("GitHub API error: {} (URL: {})", error_msg, url);
                     } else {
@@ -210,7 +293,10 @@ async fn read_content(
             }
         }
         Err(e) => {
-            error!("Failed to fetch from GitHub API: {} (URL: {})", e, url);
+            error!(
+                "[tenant:{}] Failed to fetch from GitHub API: {} (URL: {})",
+                tenant_domain, e, url
+            );
             return Err(HiveError::FetchError(e));
         }
     };
@@ -240,6 +326,7 @@ async fn read_directory_contents(
     repo: &str,
     path_pattern: &str,
     content: &mut Vec<u8>,
+    github_token: Option<&str>,
 ) -> Result<(), HiveError> {
     // Extract directory path and file pattern from glob
     // e.g., "prod/default/nginx/*.yaml" -> dir="prod/default/nginx", pattern="*.yaml"
@@ -271,7 +358,7 @@ async fn read_directory_contents(
 
     debug!("Fetching directory listing from: {}", dir_url);
 
-    let response = fetch_data(&dir_url).await.map_err(|e| {
+    let response = fetch_data(&dir_url, github_token).await.map_err(|e| {
         error!(
             "Failed to fetch directory listing: {} (URL: {})",
             e, dir_url
@@ -343,10 +430,12 @@ async fn read_directory_contents(
     for (name, download_url) in matching_files {
         debug!("Fetching file: {} from {}", name, download_url);
 
-        let raw_data = download_raw_data(&download_url).await.map_err(|e| {
-            error!("Failed to download {}: {}", name, e);
-            HiveError::FetchError(e)
-        })?;
+        let raw_data = download_raw_data(&download_url, github_token)
+            .await
+            .map_err(|e| {
+                error!("Failed to download {}: {}", name, e);
+                HiveError::FetchError(e)
+            })?;
 
         // Add YAML document separator and content
         content.append(&mut "\n---\n".as_bytes().to_vec());
@@ -504,17 +593,17 @@ fn encrypt_with_sops(input: String) -> Result<String, HiveError> {
     String::from_utf8(output.stdout).map_err(HiveError::FromUtf8Error)
 }
 
-async fn download_raw_data(url: &str) -> HTTPResult<String> {
-    let user = std::env::var("GHUSER").unwrap_or(String::from("default"));
-    let password = std::env::var("GHPASS").unwrap_or_default();
-
-    let mut buf = String::new();
-    general_purpose::STANDARD.encode_string(format!("{}:{}", user, password).as_bytes(), &mut buf);
-
-    let basic_token = format!("Basic {}", buf);
-    let token_header_value = reqwest::header::HeaderValue::from_bytes(basic_token.as_bytes())?;
-
+async fn download_raw_data(url: &str, github_token: Option<&str>) -> HTTPResult<String> {
     let mut headers = reqwest::header::HeaderMap::new();
+
+    // GitHub token is required - no fallback
+    let token = github_token.ok_or_else(|| {
+        Box::new(std::io::Error::other(
+            "GitHub token not provided - check tenant_secrets configuration",
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
+    let token_header_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))?;
     headers.insert("Authorization", token_header_value);
 
     let client = reqwest::Client::builder()
@@ -533,17 +622,17 @@ async fn download_raw_data(url: &str) -> HTTPResult<String> {
     Ok(body)
 }
 
-async fn fetch_data(url: &str) -> HTTPResult<JsonValue> {
-    let user = std::env::var("GHUSER").unwrap_or(String::from("default"));
-    let password = std::env::var("GHPASS").unwrap_or_default();
-
-    let mut buf = String::new();
-    general_purpose::STANDARD.encode_string(format!("{}:{}", user, password).as_bytes(), &mut buf);
-
-    let basic_token = format!("Basic {}", buf);
-    let token_header_value = reqwest::header::HeaderValue::from_bytes(basic_token.as_bytes())?;
-
+async fn fetch_data(url: &str, github_token: Option<&str>) -> HTTPResult<JsonValue> {
     let mut headers = reqwest::header::HeaderMap::new();
+
+    // GitHub token is required - no fallback
+    let token = github_token.ok_or_else(|| {
+        Box::new(std::io::Error::other(
+            "GitHub token not provided - check tenant_secrets configuration",
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
+    let token_header_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))?;
     headers.insert("Authorization", token_header_value);
     headers.insert(
         "User-Agent",
@@ -580,6 +669,17 @@ struct GrpcServer {
 }
 
 impl GrpcServer {
+    /// Get tenant domain for logging purposes
+    async fn get_tenant_domain(&self, tenant_id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>("SELECT domain FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&self.readonly_db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| tenant_id.to_string())
+    }
+
     async fn get_cluster_data(&self, cluster_id: Uuid) -> Result<ClusterRow, HiveError> {
         sqlx::query_as::<_, ClusterRow>(
             r#"
@@ -650,6 +750,120 @@ impl GrpcServer {
             Status::not_found(message)
         })
     }
+
+    /// Get release data using an existing transaction (for RLS enforcement)
+    async fn get_release_data_with_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        release_id: Uuid,
+    ) -> Result<ReleaseRow, Status> {
+        sqlx::query_as::<_, ReleaseRow>(
+            r#"
+            SELECT
+                releases.id,
+                releases.service_id,
+                releases.repo_branch_id,
+                releases.hash,
+                releases.path,
+                releases.name,
+                releases.version,
+                releases.namespace_id,
+                releases.git_sha,
+                releases.diff_generation,
+                releases.started_first_install_at,
+                releases.completed_first_install_at,
+                releases.failed_update_install_at,
+                releases.marked_for_deletion_at,
+                releases.started_delete_at,
+                releases.completed_delete_at,
+                releases.approved_at,
+                releases.unapproved_at,
+                releases.previous_installed_hash,
+                repo_branches.branch,
+                repos.org,
+                repos.repo,
+                namespaces.name as namespace_name,
+                clusters.id as cluster_id,
+                clusters.name as cluster_name
+            FROM
+                releases
+            JOIN
+                repo_branches ON releases.repo_branch_id = repo_branches.id
+            JOIN
+                repos ON repo_branches.repo_id = repos.id
+            JOIN
+                namespaces on releases.namespace_id = namespaces.id
+            JOIN
+                clusters on namespaces.cluster_id = clusters.id
+            WHERE
+                releases.id = $1
+            "#,
+        )
+        .bind(release_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| {
+            let hive_error = HiveError::FailedFindingRelease(e.into());
+            let message = format!("{}", hive_error);
+            error!("{}", message);
+            Status::not_found(message)
+        })
+    }
+
+    /// Fetch and decrypt GitHub token from tenant_secrets
+    /// Falls back to GITHUB_TOKEN environment variable if not found in database
+    /// Returns None if no token is found
+    async fn get_github_token(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant_domain: &str,
+    ) -> Result<Option<String>, Status> {
+        // Fetch encrypted secret from database
+        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+            r#"
+            SELECT ciphertext, iv
+            FROM tenant_secrets
+            WHERE purpose = 'github_token'
+              AND deleted_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to fetch GitHub token: {}", e)))?;
+
+        let Some((ciphertext, iv)) = row else {
+            // Fall back to environment variables
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                debug!(
+                    "[tenant:{}] Using GitHub token from GITHUB_TOKEN environment variable (fallback)",
+                    tenant_domain
+                );
+                return Ok(Some(token));
+            }
+
+            return Err(Status::failed_precondition(
+                format!("No GitHub token configured for tenant '{}'", tenant_domain)
+            ));
+        };
+
+        // Get encryption key from environment
+        let key = crypto::get_encryption_key()
+            .map_err(|e| Status::internal(format!("Failed to get encryption key: {}", e)))?;
+
+        // Decrypt the token
+        let plaintext_bytes = crypto::decrypt(&key, &ciphertext, &iv)
+            .map_err(|e| Status::internal(format!("Failed to decrypt GitHub token: {}", e)))?;
+
+        let token = String::from_utf8(plaintext_bytes)
+            .map_err(|e| Status::internal(format!("GitHub token is not valid UTF-8: {}", e)))?;
+
+        debug!(
+            "[tenant:{}] Successfully decrypted GitHub token from tenant_secrets",
+            tenant_domain
+        );
+        Ok(Some(token))
+    }
 }
 
 #[tonic::async_trait]
@@ -658,55 +872,73 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::ClusterName>,
     ) -> Result<Response<beecd::ClusterId>, Status> {
+        // Extract tenant context from request extensions (set by auth interceptor)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let data_request = request.into_inner();
         let cluster_name = data_request.cluster_name;
         let metadata = data_request.metadata;
         let version = data_request.version;
         let kubernetes_version = data_request.kubernetes_version;
 
-        info!("Registering cluster '{}'", cluster_name);
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        info!(
+            "[tenant:{}] Registering cluster '{}'",
+            tenant_domain, cluster_name
+        );
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
 
         let query = r#"
         WITH find_id AS (
-            SELECT id FROM clusters WHERE name = $1
+            SELECT id FROM clusters WHERE name = $1 AND tenant_id = $2
         ),
         insert_if_not_exists AS (
-            INSERT INTO clusters (id, name, metadata, version, kubernetes_version) SELECT gen_random_uuid(), $1, $2, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM find_id)
+            INSERT INTO clusters (id, tenant_id, name, metadata, version, kubernetes_version) 
+            SELECT gen_random_uuid(), $2, $1, $3, $4, $5 WHERE NOT EXISTS (SELECT 1 FROM find_id)
             RETURNING id
         ),
         update_if_exists AS (
-            UPDATE clusters set metadata=$2, version=$3, kubernetes_version=$4 WHERE id IN (SELECT id from find_id)
+            UPDATE clusters SET metadata=$3, version=$4, kubernetes_version=$5 WHERE id IN (SELECT id FROM find_id)
             RETURNING id
         )
         SELECT id
         FROM find_id
-
         UNION ALL
-
         SELECT id
         FROM insert_if_not_exists
-
         UNION ALL
-
         SELECT id
         FROM update_if_exists;
         "#;
         let row = sqlx::query(query)
             .bind(&cluster_name)
+            .bind(tenant_ctx.tenant_id)
             .bind(&metadata)
             .bind(&version)
             .bind(&kubernetes_version)
-            .fetch_one(&self.db)
+            .fetch_one(&mut *tx)
             .await;
 
         let cluster_id: Uuid = match row {
             Ok(r) => r.try_get("id").unwrap(),
             Err(e) => {
                 let message = format!("{}", e);
-                error!("({}) {}", cluster_name, message);
+                error!("[tenant:{}] ({}) {}", tenant_domain, cluster_name, message);
                 return Err(Status::invalid_argument(message));
             }
         };
+
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
         Ok(Response::new(beecd::ClusterId {
             cluster_id: cluster_id.to_string(),
@@ -717,6 +949,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::ClientNamespaceRegistrationRequest>,
     ) -> Result<Response<beecd::ClientNamespaceRegistrationResponse>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
         let cluster_id = match Uuid::parse_str(request_data.cluster_id.as_str()) {
             Ok(u) => u,
@@ -728,25 +963,41 @@ impl Worker for GrpcServer {
             }
         };
 
-        let cluster_data = match self.get_cluster_data(cluster_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                let message = format!("{}", e);
-                error!("{}", message);
-                return Err(Status::not_found(message));
-            }
-        };
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let cluster_data =
+            match sqlx::query_as::<_, ClusterRow>(r#"SELECT name FROM clusters WHERE id = $1"#)
+                .bind(cluster_id)
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let message = format!("Cluster not found: {}", e);
+                    error!("[tenant:{}] {}", tenant_domain, message);
+                    return Err(Status::not_found(message));
+                }
+            };
 
         let namespaces = request_data.namespace;
         debug!(
-            "({}) Registering namespaces: {}",
+            "[tenant:{}] ({}) Registering namespaces: {}",
+            tenant_domain,
             cluster_data.name,
             &namespaces.join(", ")
         );
 
         let query_result = sqlx::query("SELECT id,name FROM namespaces WHERE cluster_id = $1")
             .bind(cluster_id)
-            .fetch_all(&self.readonly_db)
+            .fetch_all(&mut *tx)
             .await;
 
         let namespaces_in_database: Vec<String> = match &query_result {
@@ -763,8 +1014,10 @@ impl Worker for GrpcServer {
             }
             Err(e) => {
                 let message = format!("Unable to lookup namespaces in database: {}", e);
-                error!("({}) {}", cluster_data.name, message);
-                save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                error!(
+                    "[tenant:{}] ({}) {}",
+                    tenant_domain, cluster_data.name, message
+                );
                 return Err(Status::unavailable(message));
             }
         };
@@ -792,13 +1045,15 @@ impl Worker for GrpcServer {
 
         for namespace in new_namespaces {
             let new_uuid_v4 = Uuid::new_v4();
-            let new =
-                sqlx::query("INSERT INTO namespaces (id, name, cluster_id) values ($1, $2, $3)")
-                    .bind(new_uuid_v4)
-                    .bind(&namespace)
-                    .bind(cluster_id)
-                    .execute(&self.db)
-                    .await;
+            let new = sqlx::query(
+                "INSERT INTO namespaces (id, name, cluster_id, tenant_id) values ($1, $2, $3, $4)",
+            )
+            .bind(new_uuid_v4)
+            .bind(&namespace)
+            .bind(cluster_id)
+            .bind(tenant_ctx.tenant_id)
+            .execute(&mut *tx)
+            .await;
             match new {
                 Ok(_) => namespace_ids.push(beecd::NamespaceMap {
                     name: namespace,
@@ -806,15 +1061,23 @@ impl Worker for GrpcServer {
                 }),
                 Err(e) => {
                     let message = format!("{}", e);
-                    error!("({}) {}", cluster_data.name, message);
-                    save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                    error!(
+                        "[tenant:{}] ({}) {}",
+                        tenant_domain, cluster_data.name, message
+                    );
                     return Err(Status::invalid_argument(message));
                 }
             }
         }
 
+        // Commit transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
+
         debug!(
-            "({}) Namespace ids: {}",
+            "[tenant:{}] ({}) Namespace ids: {}",
+            tenant_domain,
             cluster_data.name,
             namespace_ids
                 .iter()
@@ -833,6 +1096,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::GetReleaseRequest>,
     ) -> Result<Response<beecd::GetReleaseResponse>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
         let cluster_id = match Uuid::parse_str(request_data.cluster_id.as_str()) {
             Ok(u) => u,
@@ -844,14 +1110,29 @@ impl Worker for GrpcServer {
             }
         };
 
-        let cluster_data = match self.get_cluster_data(cluster_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                let message = format!("{}", e);
-                error!("{}", message);
-                return Err(Status::not_found(message));
-            }
-        };
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let cluster_data =
+            match sqlx::query_as::<_, ClusterRow>(r#"SELECT name FROM clusters WHERE id = $1"#)
+                .bind(cluster_id)
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let message = format!("Cluster not found: {}", e);
+                    error!("[tenant:{}] {}", tenant_domain, message);
+                    return Err(Status::not_found(message));
+                }
+            };
 
         let mut namespace_ids: Vec<Uuid> = vec![];
         for s in request_data.namespace_id {
@@ -859,8 +1140,10 @@ impl Worker for GrpcServer {
                 Ok(u) => namespace_ids.push(u),
                 Err(e) => {
                     let message = format!("argument 'namespace_id' {}", e);
-                    error!("({}) {}", cluster_data.name, message);
-                    save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                    error!(
+                        "[tenant:{}] ({}) {}",
+                        tenant_domain, cluster_data.name, message
+                    );
                     return Err(Status::invalid_argument(message));
                 }
             }
@@ -906,14 +1189,13 @@ impl Worker for GrpcServer {
             "#,
         )
         .bind(cluster_id)
-        .fetch_all(&self.readonly_db)
+        .fetch_all(&mut *tx)
         .await
         {
             Ok(service_definitions) => service_definitions,
             Err(e) => {
                 let message = format!("Unable to lookup branch relationships in database: {}", e);
-                error!("({}) {}", cluster_data.name, message);
-                save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                error!("[tenant:{}] ({}) {}", tenant_domain, cluster_data.name, message);
                 return Err(Status::not_found(message));
             }
         };
@@ -929,7 +1211,8 @@ impl Worker for GrpcServer {
             .collect();
 
         debug!(
-            "({}) Found service names: {}",
+            "[tenant:{}] ({}) Found service names: {}",
+            tenant_domain,
             cluster_data.name,
             service_names.join(",")
         );
@@ -972,13 +1255,15 @@ impl Worker for GrpcServer {
                 .bind(&data.branch)
                 .bind(vec![data.service_name])
                 .bind(&namespace_ids)
-                .fetch_all(&self.readonly_db)
+                .fetch_all(&mut *tx)
                 .await
             {
                 Err(e) => {
                     let message = format!("Unable to lookup service versions: {}", e);
-                    error!("({}) {}", cluster_data.name, message);
-                    save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                    error!(
+                        "[tenant:{}] ({}) {}",
+                        tenant_domain, cluster_data.name, message
+                    );
                     return Err(Status::not_found(message));
                 }
                 Ok(service_versions) => {
@@ -1013,7 +1298,7 @@ impl Worker for GrpcServer {
                         )
                         .bind(&name)
                         .bind(namespace_id)
-                        .fetch_optional(&self.readonly_db)
+                        .fetch_optional(&mut *tx)
                         .await
                         {
                             Ok(opt) => opt.is_some(),
@@ -1034,7 +1319,7 @@ impl Worker for GrpcServer {
                         )
                         .bind(namespace_id)
                         .bind(&hash)
-                        .fetch_one(&self.readonly_db)
+                        .fetch_one(&mut *tx)
                         .await
                         .map_or(0, |row| row.try_get("max").unwrap_or(0));
 
@@ -1070,7 +1355,7 @@ impl Worker for GrpcServer {
                             )
                             .bind(namespace_id)
                             .bind(&name)
-                            .fetch_one(&self.readonly_db)
+                            .fetch_one(&mut *tx)
                             .await
                         {
                             if release_row.marked_for_deletion_at.is_some()
@@ -1088,7 +1373,7 @@ impl Worker for GrpcServer {
                                 "#,
                                 )
                                 .bind(release_row.id)
-                                .execute(&self.db)
+                                .execute(&mut *tx)
                                 .await
                                 .map_err(|e| {
                                     Status::unavailable(format!(
@@ -1127,7 +1412,7 @@ impl Worker for GrpcServer {
                         )
                         .bind(namespace_id)
                         .bind(&name)
-                        .fetch_one(&self.readonly_db)
+                        .fetch_one(&mut *tx)
                         .await
                         .map_or(0, |c| c.count);
 
@@ -1138,16 +1423,22 @@ impl Worker for GrpcServer {
                         };
 
                         // Begin transaction to ensure atomicity of release insert/update, reinstate, and deprecate operations
-                        let mut tx = self.db.begin().await.map_err(|e| {
+                        let mut inner_tx = self.db.begin().await.map_err(|e| {
                             let message = format!("Failed to begin transaction: {}", e);
-                            error!("({}) {}", cluster_data.name, message);
+                            error!(
+                                "[tenant:{}] ({}) {}",
+                                tenant_domain, cluster_data.name, message
+                            );
                             Status::internal(message)
                         })?;
+                        // Set tenant context for RLS on inner transaction
+                        auth::set_tenant_context(&mut *inner_tx, tenant_ctx.tenant_id).await?;
 
                         let insert_or_update_hive_releases = sqlx::query(r#"
                                 INSERT INTO releases
                                 (
                                     id,
+                                    tenant_id,      --tenant
                                     service_id,     --1
                                     namespace_id,   --2
                                     path,           --3
@@ -1169,6 +1460,7 @@ impl Worker for GrpcServer {
                                 VALUES
                                 (
                                     (SELECT gen_random_uuid()),
+                                    $14,
                                     $1,
                                     $2,
                                     $3,
@@ -1191,7 +1483,7 @@ impl Worker for GrpcServer {
                                     $12,
                                     $13
                                 )
-                                ON CONFLICT (service_id, namespace_id)
+                                ON CONFLICT (tenant_id, namespace_id, service_id)
                                 DO UPDATE SET
                                     path = EXCLUDED.path,
                                     hash = EXCLUDED.hash,
@@ -1217,14 +1509,15 @@ impl Worker for GrpcServer {
                                     .bind(diff_generation)
                                     .bind(marked_for_deletion_at)
                                     .bind(deprecated)
-                                    .execute(&mut *tx)
+                                    .bind(tenant_ctx.tenant_id)
+                                    .execute(&mut *inner_tx)
                                     .await;
 
                         match insert_or_update_hive_releases {
                             Ok(result) => {
                                 if result.rows_affected() == 0 && !reinstate {
                                     // Rollback transaction and continue to next release
-                                    if let Err(e) = tx.rollback().await {
+                                    if let Err(e) = inner_tx.rollback().await {
                                         warn!(
                                             "({}) Rollback failed (continuing to next release): {}",
                                             cluster_data.name, e
@@ -1257,7 +1550,7 @@ impl Worker for GrpcServer {
                                     )
                                     .bind(service_id)
                                     .bind(namespace_id)
-                                    .execute(&mut *tx)
+                                    .execute(&mut *inner_tx)
                                     .await
                                     {
                                         Ok(_) => {}
@@ -1267,38 +1560,20 @@ impl Worker for GrpcServer {
                                                 name,
                                                 e
                                             );
-                                            error!("({}) {}", cluster_data.name, message);
-                                            if let Err(e) = tx.rollback().await {
-                                                warn!("({}) Rollback failed after reinstate error: {}", cluster_data.name, e);
+                                            error!(
+                                                "[tenant:{}] ({}) {}",
+                                                tenant_domain, cluster_data.name, message
+                                            );
+                                            if let Err(e) = inner_tx.rollback().await {
+                                                warn!("[tenant:{}] ({}) Rollback failed after reinstate error: {}", tenant_domain, cluster_data.name, e);
                                             }
-                                            match sqlx::query(
-                                                r#"
-                                                    INSERT INTO hive_errors
-                                                        (cluster_id, message)
-                                                    values
-                                                        ($1, $2)
-                                                    ON CONFLICT
-                                                        (cluster_id, message)
-                                                    DO
-                                                        UPDATE SET deprecated_at = NULL;
-                                                "#,
+                                            save_hive_err_to_db(
+                                                tenant_ctx.tenant_id,
+                                                &cluster_id,
+                                                &message,
+                                                &self.db,
                                             )
-                                            .bind(cluster_id)
-                                            .bind(&message)
-                                            .execute(&self.db)
-                                            .await
-                                            {
-                                                Ok(_) => {}
-                                                Err(e) => {
-                                                    trace!(
-                                                        "({}) Failed writing error to database: {}",
-                                                        cluster_data.name,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            save_hive_err_to_db(&cluster_id, &message, &self.db)
-                                                .await;
+                                            .await;
                                             return Err(Status::internal(message));
                                         }
                                     }
@@ -1306,14 +1581,16 @@ impl Worker for GrpcServer {
                             }
                             Err(e) => {
                                 let message = format!("Error finding releases: {}", e);
-                                error!("({}) {}", cluster_data.name, message);
-                                if let Err(e) = tx.rollback().await {
+                                error!(
+                                    "[tenant:{}] ({}) {}",
+                                    tenant_domain, cluster_data.name, message
+                                );
+                                if let Err(e) = inner_tx.rollback().await {
                                     warn!(
                                         "({}) Rollback failed after insert error: {}",
                                         cluster_data.name, e
                                     );
                                 }
-                                save_hive_err_to_db(&cluster_id, &message, &self.db).await;
                                 return Err(Status::not_found(message));
                             }
                         }
@@ -1339,37 +1616,45 @@ impl Worker for GrpcServer {
                             .bind(namespace_id)
                             .bind(name)
                             .bind(service_id)
-                            .execute(&mut *tx)
+                            .execute(&mut *inner_tx)
                             .await;
 
                             match deprecate_result {
                                 Ok(_) => {
                                     // Commit the transaction
-                                    tx.commit().await.map_err(|e| {
+                                    inner_tx.commit().await.map_err(|e| {
                                         let message =
                                             format!("Failed to commit transaction: {}", e);
-                                        error!("({}) {}", cluster_data.name, message);
+                                        error!(
+                                            "[tenant:{}] ({}) {}",
+                                            tenant_domain, cluster_data.name, message
+                                        );
                                         Status::internal(message)
                                     })?;
                                 }
                                 Err(e) => {
                                     let message = format!("deprecate_result was an error: {}", e);
-                                    error!("({}) {}", cluster_data.name, message);
-                                    if let Err(e) = tx.rollback().await {
+                                    error!(
+                                        "[tenant:{}] ({}) {}",
+                                        tenant_domain, cluster_data.name, message
+                                    );
+                                    if let Err(e) = inner_tx.rollback().await {
                                         warn!(
                                             "({}) Rollback failed after deprecation error: {}",
                                             cluster_data.name, e
                                         );
                                     }
-                                    save_hive_err_to_db(&cluster_id, &message, &self.db).await;
                                     return Err(Status::internal(message));
                                 }
                             }
                         } else {
                             // Manually selected release - skip deprecation and just commit
-                            tx.commit().await.map_err(|e| {
+                            inner_tx.commit().await.map_err(|e| {
                                 let message = format!("Failed to commit transaction: {}", e);
-                                error!("({}) {}", cluster_data.name, message);
+                                error!(
+                                    "[tenant:{}] ({}) {}",
+                                    tenant_domain, cluster_data.name, message
+                                );
                                 Status::internal(message)
                             })?;
                         }
@@ -1420,7 +1705,7 @@ impl Worker for GrpcServer {
                         )
                         .bind(service_id)
                         .bind(namespace_id)
-                        .fetch_one(&self.readonly_db)
+                        .fetch_one(&mut *tx)
                         .await
                         {
                             Ok(row) => releases.push(beecd::Release {
@@ -1446,8 +1731,10 @@ impl Worker for GrpcServer {
                             }),
                             Err(e) => {
                                 let message = format!("Error selecting available releases: {}", e);
-                                error!("({}) {}", cluster_data.name, message);
-                                save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                                error!(
+                                    "[tenant:{}] ({}) {}",
+                                    tenant_domain, cluster_data.name, message
+                                );
                                 return Err(Status::internal(message));
                             }
                         };
@@ -1505,7 +1792,7 @@ impl Worker for GrpcServer {
         "#,
         )
         .bind(&namespace_ids)
-        .fetch_all(&self.readonly_db)
+        .fetch_all(&mut *tx)
         .await
         {
             Ok(rows) => {
@@ -1535,14 +1822,22 @@ impl Worker for GrpcServer {
             }
             Err(e) => {
                 let message = format!("Error selecting available releases: {}", e);
-                error!("({}) {}", cluster_data.name, message);
-                save_hive_err_to_db(&cluster_id, &message, &self.db).await;
+                error!(
+                    "[tenant:{}] ({}) {}",
+                    tenant_domain, cluster_data.name, message
+                );
                 return Err(Status::internal(message));
             }
         };
 
+        // Commit the outer transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
+
         debug!(
-            "({}) Found {} available releases: {}",
+            "[tenant:{}] ({}) Found {} available releases: {}",
+            tenant_domain,
             cluster_data.name,
             releases.len(),
             releases
@@ -1568,6 +1863,9 @@ impl Worker for GrpcServer {
         // ones, then the agent will request
         // each manifest for that service.
 
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
 
         let release_id = match Uuid::parse_str(&request_data.release_id) {
@@ -1580,14 +1878,34 @@ impl Worker for GrpcServer {
             }
         };
 
-        let release_data = self.get_release_data(release_id).await?;
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        // Get tenant domain for logging
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Fetch and decrypt GitHub token from tenant_secrets
+        let github_token = self.get_github_token(&mut tx, &tenant_domain).await?;
+
+        let release_data = self.get_release_data_with_tx(&mut tx, release_id).await?;
+
+        // Commit transaction early - we don't need it for GitHub API calls
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
         // Detect if this is a directory pattern by checking if path contains glob wildcards
         // This is temporary until migration adds is_directory_pattern column
         let is_directory_pattern = release_data.path.contains('*');
 
         info!(
-            "GetServiceManifest for {}/{}/{}: org={}, repo={}, path={}, is_directory={}, git_sha={}",
+            "[tenant:{}] GetServiceManifest for {}/{}/{}: org={}, repo={}, path={}, is_directory={}, git_sha={}",
+            tenant_domain,
             release_data.cluster_name,
             release_data.namespace_name,
             release_data.name,
@@ -1616,6 +1934,7 @@ impl Worker for GrpcServer {
                 &release_data.repo,
                 &release_data.path,
                 &mut data,
+                github_token.as_deref(),
             )
             .await
             {
@@ -1642,7 +1961,15 @@ impl Worker for GrpcServer {
                 release_data.path.trim_start_matches('/'),
             );
 
-            match read_content(&url_query, &base_url, &mut data).await {
+            match read_content(
+                &url_query,
+                &base_url,
+                &mut data,
+                github_token.as_deref(),
+                &tenant_domain,
+            )
+            .await
+            {
                 Ok(_) => {}
                 Err(e) => {
                     let message = format!("{}", e);
@@ -1684,6 +2011,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::ServiceStatusRequest>,
     ) -> Result<Response<beecd::Empty>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
 
         let diff_generation = request_data.diff_generation;
@@ -1703,10 +2033,23 @@ impl Worker for GrpcServer {
         };
 
         let in_cluster_manifest = request_data.in_cluster_manifest;
-        let release_data = self.get_release_data(release_id).await?;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        // Get tenant domain for logging
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        let release_data = self.get_release_data_with_tx(&mut tx, release_id).await?;
 
         info!(
-            "({}/{}/{}) ServiceStatus received: diff_generation={}, is_next_generation_diff={}, is_diff={}, diff_count={}",
+            "[tenant:{}] ({}/{}/{}) ServiceStatus received: diff_generation={}, is_next_generation_diff={}, is_diff={}, diff_count={}",
+            tenant_domain,
             release_data.cluster_name,
             release_data.namespace_name,
             release_data.name,
@@ -1730,7 +2073,7 @@ impl Worker for GrpcServer {
             )
             .bind(release_data.id)
             .bind(&previous_installed_hash)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {}
@@ -1759,7 +2102,7 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(release_data.id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {}
@@ -1791,7 +2134,7 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(release_id)
-            .fetch_one(&self.readonly_db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
                 let hive_error = HiveError::FailedFindingRelease(e.into());
@@ -1821,7 +2164,7 @@ impl Worker for GrpcServer {
             )
             .bind(release_info.namespace_id)
             .bind(&previous_installed_hash)
-            .fetch_one(&self.readonly_db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
                 let hive_error = HiveError::FailedFindingRelease(e.into());
@@ -1842,7 +2185,7 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(release_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {}
@@ -1877,7 +2220,7 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(previous_release_info.id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {
@@ -1908,19 +2251,7 @@ impl Worker for GrpcServer {
 
             let diff_data = request_data.diff;
 
-            // Begin transaction to ensure atomicity of release update and diff inserts
-            let mut tx = self.db.begin().await.map_err(|e| {
-                let message = format!("Failed to begin transaction: {}", e);
-                error!(
-                    "({}/{}/{}) {}",
-                    release_data.cluster_name,
-                    release_data.namespace_name,
-                    release_data.name,
-                    message
-                );
-                Status::internal(message)
-            })?;
-
+            // Continue using the main transaction for atomicity
             let update_release_query = sqlx::query(
                 r#"
                 UPDATE
@@ -1964,7 +2295,13 @@ impl Worker for GrpcServer {
                             e
                         );
                     }
-                    save_hive_err_to_db(&release_data.cluster_id, &message, &self.db).await;
+                    save_hive_err_to_db(
+                        tenant_ctx.tenant_id,
+                        &release_data.cluster_id,
+                        &message,
+                        &self.db,
+                    )
+                    .await;
                     return Err(Status::not_found(message));
                 }
             }
@@ -1996,6 +2333,7 @@ impl Worker for GrpcServer {
                                         );
                                     }
                                     save_hive_err_to_db(
+                                        tenant_ctx.tenant_id,
                                         &release_data.cluster_id,
                                         &message,
                                         &self.db,
@@ -2026,7 +2364,13 @@ impl Worker for GrpcServer {
                                 e
                             );
                         }
-                        save_hive_err_to_db(&release_data.cluster_id, &message, &self.db).await;
+                        save_hive_err_to_db(
+                            tenant_ctx.tenant_id,
+                            &release_data.cluster_id,
+                            &message,
+                            &self.db,
+                        )
+                        .await;
                         return Err(Status::invalid_argument(message));
                     }
                 };
@@ -2046,13 +2390,14 @@ impl Worker for GrpcServer {
 
                 match sqlx::query(
                     r#"
-                    INSERT INTO resource_diffs (release_id, diff_generation, key, storage_url, change_order)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO resource_diffs (tenant_id, release_id, diff_generation, key, storage_url, change_order)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (key, release_id, diff_generation) DO UPDATE SET
                         storage_url = EXCLUDED.storage_url,
                         change_order = EXCLUDED.change_order
                 "#,
                 )
+                .bind(tenant_ctx.tenant_id)
                 .bind(release_id)
                 .bind(diff_generation)
                 .bind(&diff.key)
@@ -2066,17 +2411,18 @@ impl Worker for GrpcServer {
                         let message =
                             format!("Error writing '{}' diff to database: {}", diff.key, e);
                         error!(
-                            "({}/{}/{}) {}",
+                            "[tenant:{}] ({}/{}/{}) {}",
+                            tenant_domain,
                             release_data.cluster_name,
                             release_data.namespace_name,
                             release_data.name,
                             message
                         );
                         if let Err(e) = tx.rollback().await {
-                            warn!("({}/{}/{}) Rollback failed after diff insert error: {}", 
-                                release_data.cluster_name, release_data.namespace_name, release_data.name, e);
+                            warn!("[tenant:{}] ({}/{}/{}) Rollback failed after diff insert error: {}", 
+                                tenant_domain, release_data.cluster_name, release_data.namespace_name, release_data.name, e);
                         }
-                        save_hive_err_to_db(&release_data.cluster_id, &message, &self.db).await;
+                        save_hive_err_to_db(tenant_ctx.tenant_id, &release_data.cluster_id, &message, &self.db).await;
                         return Err(Status::not_found(message));
                     }
                 }
@@ -2133,8 +2479,13 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(release_data.id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await;
+
+            // Commit the transaction
+            tx.commit()
+                .await
+                .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
             Ok(Response::new(beecd::Empty {}))
         }
@@ -2144,6 +2495,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::RestoreDiffRequest>,
     ) -> Result<Response<beecd::RestoreDiffResponse>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
 
         let release_id = match Uuid::parse_str(&request_data.release_id) {
@@ -2155,7 +2509,18 @@ impl Worker for GrpcServer {
                 )))
             }
         };
-        let release_data = self.get_release_data(release_id).await?;
+
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let release_data = self.get_release_data_with_tx(&mut tx, release_id).await?;
 
         #[derive(sqlx::FromRow)]
         struct DiffRow {
@@ -2178,7 +2543,7 @@ impl Worker for GrpcServer {
         )
         .bind(release_data.id)
         .bind(release_data.diff_generation)
-        .fetch_all(&self.readonly_db)
+        .fetch_all(&mut *tx)
         .await
         {
             Ok(rows) => rows,
@@ -2187,8 +2552,10 @@ impl Worker for GrpcServer {
                     "Failed retrieving diffs {}/{} from database: {}",
                     release_data.namespace_name, release_data.name, e
                 );
-                error!("({}) {}", release_data.cluster_name, message);
-                save_hive_err_to_db(&release_data.cluster_id, &message, &self.db).await;
+                error!(
+                    "[tenant:{}] ({}) {}",
+                    tenant_domain, release_data.cluster_name, message
+                );
                 return Err(Status::not_found(message));
             }
         };
@@ -2198,6 +2565,7 @@ impl Worker for GrpcServer {
             .filter_map(|row| {
                 let cluster_name = release_data.cluster_name.clone();
                 let release_name = release_data.name.clone();
+                let tenant_domain_clone = tenant_domain.clone();
                 async move {
 
                     let key = &row.key;
@@ -2215,7 +2583,7 @@ impl Worker for GrpcServer {
                             Err(e) => {
                                 let message =
                                     format!("Failed to write sops file for diff of {} for key '{}': {}", release_name, key, e);
-                                error!("({}) {}", cluster_name, message);
+                                error!("[tenant:{}] ({}) {}", tenant_domain_clone, cluster_name, message);
                                 return None;
                             }
                         }
@@ -2227,7 +2595,7 @@ impl Worker for GrpcServer {
                             Ok(s) => s,
                             Err(e) => {
                                 let message = format!("Failed to execute sops command looking for diff of {} for key {}: {}", release_name, key, e);
-                                error!("({}) {}", cluster_name, message);
+                                error!("[tenant:{}] ({}) {}", tenant_domain_clone, cluster_name, message);
                                 return None;
                             }
                         };
@@ -2241,7 +2609,7 @@ impl Worker for GrpcServer {
                                             "Failed to parse diff of {} for key '{}': {}",
                                             release_name, key, e
                                         );
-                                        error!("({}) {}", cluster_name, message);
+                                        error!("[tenant:{}] ({}) {}", tenant_domain_clone, cluster_name, message);
                                         return None;
                                     }
                                 };
@@ -2271,7 +2639,7 @@ impl Worker for GrpcServer {
                                 "Sops command exited unsuccessfully for {} release : {}",
                                 release_name, err_string
                             );
-                            error!("({}) {}", cluster_name, message);
+                            error!("[tenant:{}] ({}) {}", tenant_domain_clone, cluster_name, message);
                             return None;
                         }
                     } else {
@@ -2296,6 +2664,11 @@ impl Worker for GrpcServer {
             );
         }
 
+        // Commit the read-only transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
+
         Ok(Response::new(beecd::RestoreDiffResponse { diff }))
     }
 
@@ -2303,6 +2676,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::ClusterId>,
     ) -> Result<Response<beecd::GetApprovedReleasesResponse>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
         let cluster_id = match Uuid::parse_str(request_data.cluster_id.as_str()) {
             Ok(u) => u,
@@ -2314,14 +2690,29 @@ impl Worker for GrpcServer {
             }
         };
 
-        let cluster_data = match self.get_cluster_data(cluster_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                let message = format!("{}", e);
-                error!("{}", message);
-                return Err(Status::not_found(message));
-            }
-        };
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let cluster_data =
+            match sqlx::query_as::<_, ClusterRow>(r#"SELECT name FROM clusters WHERE id = $1"#)
+                .bind(cluster_id)
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let message = format!("Cluster not found: {}", e);
+                    error!("[tenant:{}] {}", tenant_domain, message);
+                    return Err(Status::not_found(message));
+                }
+            };
 
         let auto_unapprove_query = r#"
         UPDATE
@@ -2342,7 +2733,7 @@ impl Worker for GrpcServer {
 
         sqlx::query(auto_unapprove_query)
             .bind(cluster_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 Status::unavailable(format!(
@@ -2371,7 +2762,7 @@ impl Worker for GrpcServer {
 
         let query_result = sqlx::query(query)
             .bind(cluster_id)
-            .fetch_all(&self.readonly_db)
+            .fetch_all(&mut *tx)
             .await;
 
         let releases: Vec<String> = match query_result {
@@ -2387,6 +2778,11 @@ impl Worker for GrpcServer {
             }
         };
 
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
+
         Ok(Response::new(beecd::GetApprovedReleasesResponse {
             release_id: releases,
         }))
@@ -2396,6 +2792,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::InstallationStatusRequest>,
     ) -> Result<Response<beecd::Empty>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
         let release_id = match Uuid::parse_str(&request_data.release_id) {
             Ok(u) => u,
@@ -2407,7 +2806,17 @@ impl Worker for GrpcServer {
             }
         };
 
-        let release_data = self.get_release_data(release_id).await?;
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let release_data = self.get_release_data_with_tx(&mut tx, release_id).await?;
 
         let completed = request_data.completed;
         let started = request_data.started;
@@ -2447,19 +2856,20 @@ impl Worker for GrpcServer {
             };
             match sqlx::query(update_query)
                 .bind(release_data.id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await
             {
                 Ok(_) => {}
                 Err(e) => {
                     let message = format!(
-                        "({}/{}/{}) could not update release: {}",
+                        "[tenant:{}] ({}/{}/{}) could not update release: {}",
+                        tenant_domain,
                         release_data.cluster_name,
                         release_data.namespace_name,
                         release_data.name,
                         e
                     );
-                    error!(message);
+                    error!("{}", message);
                     return Err(Status::internal(message));
                 }
             }
@@ -2499,13 +2909,14 @@ impl Worker for GrpcServer {
             };
             match sqlx::query(update_query)
                 .bind(release_data.id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await
             {
                 Ok(_) => {}
                 Err(e) => {
-                    let message = format!("could not update release: {}", e);
-                    error!(message);
+                    let message =
+                        format!("[tenant:{}] could not update release: {}", tenant_domain, e);
+                    error!("{}", message);
                     return Err(Status::internal(message));
                 }
             }
@@ -2538,7 +2949,7 @@ impl Worker for GrpcServer {
             };
             match sqlx::query(update_query)
                 .bind(release_data.id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await
             {
                 Ok(_) => {}
@@ -2550,8 +2961,10 @@ impl Worker for GrpcServer {
             }
         }
 
-        // TODO failed
-        // TODO use msg
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
         Ok(Response::new(beecd::Empty {}))
     }
@@ -2561,6 +2974,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::LogReleaseErrorRequest>,
     ) -> Result<Response<beecd::Empty>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
         let release_id = match Uuid::parse_str(&request_data.release_id) {
             Ok(u) => u,
@@ -2572,7 +2988,17 @@ impl Worker for GrpcServer {
             }
         };
 
-        let release_data = self.get_release_data(release_id).await?;
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let release_data = self.get_release_data_with_tx(&mut tx, release_id).await?;
 
         let is_deprecated = request_data.is_deprecated;
         let raw_message = request_data.message;
@@ -2589,13 +3015,14 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(release_data.id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {}
                 Err(e) => {
                     error!(
-                        "({}/{}/{}) Failed writing error to database: {}",
+                        "[tenant:{}] ({}/{}/{}) Failed writing error to database: {}",
+                        tenant_domain,
                         release_data.cluster_name,
                         release_data.namespace_name,
                         release_data.name,
@@ -2607,26 +3034,35 @@ impl Worker for GrpcServer {
             match sqlx::query(
                 r#"
                     INSERT INTO release_errors
-                        (release_id, message)
+                        (release_id, message, tenant_id)
                     values
-                        ($1, $2)
+                        ($1, $2, $3)
                     ON CONFLICT
-                        (release_id, message)
+                        (tenant_id, release_id, message)
                     DO
                         UPDATE SET deprecated_at = NULL;
                 "#,
             )
             .bind(release_data.id)
             .bind(&message)
-            .execute(&self.db)
+            .bind(tenant_ctx.tenant_id)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {}
                 Err(e) => {
-                    error!("Failed writing error to database: {}", e);
+                    error!(
+                        "[tenant:{}] Failed writing error to database: {}",
+                        tenant_domain, e
+                    );
                 }
             }
         }
+
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
         Ok(Response::new(beecd::Empty {}))
     }
@@ -2638,6 +3074,9 @@ impl Worker for GrpcServer {
         &self,
         request: Request<beecd::LogHiveErrorRequest>,
     ) -> Result<Response<beecd::Empty>, Status> {
+        // Extract tenant context FIRST (before into_inner)
+        let tenant_ctx = auth::TenantContext::from_request(&request)?;
+
         let request_data = request.into_inner();
         let cluster_id = match Uuid::parse_str(request_data.cluster_id.as_str()) {
             Ok(u) => u,
@@ -2649,14 +3088,29 @@ impl Worker for GrpcServer {
             }
         };
 
-        let cluster_data = match self.get_cluster_data(cluster_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                let message = format!("{}", e);
-                error!("{}", message);
-                return Err(Status::not_found(message));
-            }
-        };
+        let tenant_domain = self.get_tenant_domain(tenant_ctx.tenant_id).await;
+
+        // Start transaction and set tenant context for RLS
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
+        auth::set_tenant_context(&mut *tx, tenant_ctx.tenant_id).await?;
+
+        let cluster_data =
+            match sqlx::query_as::<_, ClusterRow>(r#"SELECT name FROM clusters WHERE id = $1"#)
+                .bind(cluster_id)
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let message = format!("Cluster not found: {}", e);
+                    error!("[tenant:{}] {}", tenant_domain, message);
+                    return Err(Status::not_found(message));
+                }
+            };
 
         let is_deprecated = request_data.is_deprecated;
 
@@ -2671,7 +3125,7 @@ impl Worker for GrpcServer {
                 "#,
             )
             .bind(cluster_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             {
                 Ok(_) => {}
@@ -2683,6 +3137,11 @@ impl Worker for GrpcServer {
                 }
             }
         }
+
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit transaction: {}", e)))?;
 
         Ok(Response::new(beecd::Empty {}))
     }
@@ -2714,9 +3173,9 @@ impl Worker for GrpcServer {
             return Err(Status::invalid_argument("Username and password required"));
         }
 
-        // 1. Validate credentials via bcrypt
+        // 1. Validate credentials via bcrypt (using SECURITY DEFINER function to bypass RLS)
         let user_row = sqlx::query_as::<_, UserAuthRow>(
-            "SELECT id, hash FROM users WHERE name = $1 AND deleted_at IS NULL",
+            "SELECT user_id, tenant_id, password_hash FROM auth_lookup_agent_user($1)",
         )
         .bind(&username)
         .fetch_optional(&self.readonly_db)
@@ -2730,11 +3189,11 @@ impl Worker for GrpcServer {
             Status::unauthenticated("Invalid credentials")
         })?;
 
-        let is_valid = bcrypt::verify(&password, &user_row.hash).map_err(|e| {
+        let is_valid = bcrypt::verify(&password, &user_row.password_hash).map_err(|e| {
             // Avoid logging the username to reduce info leakage; log user_id instead
             error!(
                 "Bcrypt verification error for user_id {}: {:?}",
-                user_row.id, e
+                user_row.user_id, e
             );
             Status::internal("Password verification failed")
         })?;
@@ -2747,18 +3206,20 @@ impl Worker for GrpcServer {
             return Err(Status::unauthenticated("Invalid credentials"));
         }
 
-        // 2. Look up cluster_id (if user matches cluster name)
-        let cluster_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM clusters WHERE name = $1 AND deleted_at IS NULL",
-        )
-        .bind(&username)
-        .fetch_optional(&self.readonly_db)
-        .await
-        .map_err(|e| Status::internal(format!("Database error: {}", e)))?
-        .unwrap_or_else(Uuid::nil); // Default to nil if no matching cluster
+        // 2. Look up cluster_id (if user matches cluster name) - using SECURITY DEFINER function
+        let cluster_id =
+            sqlx::query_scalar::<_, Option<Uuid>>("SELECT auth_lookup_cluster_by_name($1, $2)")
+                .bind(&username)
+                .bind(user_row.tenant_id)
+                .fetch_optional(&self.readonly_db)
+                .await
+                .map_err(|e| Status::internal(format!("Database error: {}", e)))?
+                .flatten()
+                .unwrap_or_else(Uuid::nil); // Default to nil if no matching cluster
 
-        // 3. Generate access token (JWT)
-        let access_token = auth::create_access_token(&username, user_row.id, cluster_id)?;
+        // 3. Generate access token (JWT) with tenant_id for RLS context
+        let access_token =
+            auth::create_access_token(&username, user_row.user_id, user_row.tenant_id, cluster_id)?;
 
         // 4. Generate refresh token
         let refresh_token_raw = auth::generate_refresh_token();
@@ -2783,27 +3244,22 @@ impl Worker for GrpcServer {
             Some(user_agent.clone()) // Clone for later logging
         };
 
-        sqlx::query(
-            r#"
-            INSERT INTO refresh_tokens 
-                (token_hash, user_id, cluster_id, expires_at, user_agent, ip_address)
-            VALUES 
-                ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(&refresh_token_hash)
-        .bind(user_row.id)
-        .bind(if cluster_id.is_nil() {
-            None
-        } else {
-            Some(cluster_id)
-        })
-        .bind(refresh_expires_at)
-        .bind(user_agent_for_db)
-        .bind(ip_to_store)
-        .execute(&self.db)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to store refresh token: {}", e)))?;
+        // Use SECURITY DEFINER function to store refresh token (bypasses RLS)
+        sqlx::query("SELECT auth_insert_refresh_token($1, $2, $3, $4, $5, $6, $7)")
+            .bind(&refresh_token_hash)
+            .bind(user_row.user_id)
+            .bind(user_row.tenant_id)
+            .bind(if cluster_id.is_nil() {
+                None
+            } else {
+                Some(cluster_id)
+            })
+            .bind(refresh_expires_at)
+            .bind(&user_agent_for_db)
+            .bind(&ip_to_store)
+            .execute(&self.db)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to store refresh token: {}", e)))?;
 
         info!(
             "Login successful: username={}, ip={}, user_agent={}",
@@ -2833,16 +3289,9 @@ impl Worker for GrpcServer {
         let refresh_token_raw = req.refresh_token;
         let refresh_token_hash = auth::hash_refresh_token(&refresh_token_raw);
 
-        // 1. Look up refresh token with user info in single JOIN query
+        // 1. Look up refresh token with user info using SECURITY DEFINER function
         let token_row = sqlx::query_as::<_, RefreshTokenRow>(
-            r#"
-            SELECT 
-                rt.id, rt.user_id, rt.cluster_id, rt.expires_at, rt.revoked_at, 
-                rt.replaced_by_token_id, u.name as username
-            FROM refresh_tokens rt
-            JOIN users u ON rt.user_id = u.id
-            WHERE rt.token_hash = $1 AND u.deleted_at IS NULL
-            "#,
+            "SELECT token_id, user_id, tenant_id, cluster_id, expires_at, revoked_at, replaced_by_token_id, username FROM auth_lookup_refresh_token($1)",
         )
         .bind(&refresh_token_hash)
         .fetch_optional(&self.readonly_db)
@@ -2863,8 +3312,12 @@ impl Worker for GrpcServer {
                 token_row.user_id
             );
 
-            // Revoke the entire token family (all descendants)
-            self.revoke_token_family(token_row.id).await?;
+            // Revoke the entire token family using SECURITY DEFINER function
+            sqlx::query("SELECT auth_revoke_token_family($1)")
+                .bind(token_row.token_id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to revoke token family: {}", e)))?;
 
             return Err(Status::unauthenticated("Invalid refresh token"));
         }
@@ -2880,9 +3333,13 @@ impl Worker for GrpcServer {
             }
         };
 
-        // 4. Generate new access token
-        let access_token =
-            auth::create_access_token(&token_row.username, token_row.user_id, cluster_id)?;
+        // 4. Generate new access token with tenant_id for RLS context
+        let access_token = auth::create_access_token(
+            &token_row.username,
+            token_row.user_id,
+            token_row.tenant_id,
+            cluster_id,
+        )?;
 
         // 5. Generate new refresh token (ROTATION)
         let new_refresh_token_raw = auth::generate_refresh_token();
@@ -2894,53 +3351,19 @@ impl Worker for GrpcServer {
             .unwrap_or(86400);
         let new_expires_at = Utc::now() + chrono::Duration::seconds(refresh_ttl);
 
-        // 6. Begin transaction for atomic rotation
-        let mut tx = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| Status::internal(format!("Failed to begin transaction: {}", e)))?;
-
-        // 7. Insert new refresh token
-        let new_token_id = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            INSERT INTO refresh_tokens 
-                (token_hash, user_id, cluster_id, expires_at, parent_token_id)
-            VALUES 
-                ($1, $2, $3, $4, $5)
-            RETURNING id
-            "#,
+        // 6. Atomic token rotation using SECURITY DEFINER function
+        let _new_token_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT auth_rotate_refresh_token($1, $2, $3, $4, $5, $6)",
         )
+        .bind(token_row.token_id)
         .bind(&new_refresh_token_hash)
         .bind(token_row.user_id)
+        .bind(token_row.tenant_id)
         .bind(token_row.cluster_id)
         .bind(new_expires_at)
-        .bind(token_row.id) // Link to parent
-        .fetch_one(&mut *tx)
+        .fetch_one(&self.db)
         .await
-        .map_err(|e| Status::internal(format!("Failed to create new refresh token: {}", e)))?;
-
-        // 8. Revoke old refresh token and link to new one
-        sqlx::query(
-            r#"
-            UPDATE refresh_tokens 
-            SET 
-                revoked_at = NOW(),
-                replaced_by_token_id = $1
-            WHERE id = $2
-            "#,
-        )
-        .bind(new_token_id)
-        .bind(token_row.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to revoke old token: {}", e)))?;
-
-        // 9. Commit transaction
-        tx.commit().await.map_err(|e| {
-            error!("Token rotation transaction commit failed: {:?}", e);
-            Status::internal("Token rotation failed, please retry")
-        })?;
+        .map_err(|e| Status::internal(format!("Token rotation failed: {}", e)))?;
 
         info!("User '{}' refreshed token successfully", token_row.username);
 
@@ -2972,47 +3395,16 @@ impl Worker for GrpcServer {
 
         let refresh_token_hash = auth::hash_refresh_token(&req.refresh_token);
 
-        // Revoke the refresh token
-        sqlx::query(
-            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL"
-        )
-        .bind(&refresh_token_hash)
-        .execute(&self.db)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to revoke token: {}", e)))?;
+        // Revoke the refresh token using SECURITY DEFINER function
+        sqlx::query("SELECT auth_revoke_refresh_token($1)")
+            .bind(&refresh_token_hash)
+            .execute(&self.db)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to revoke token: {}", e)))?;
 
         info!("Refresh token revoked");
 
         Ok(Response::new(beecd::Empty {}))
-    }
-}
-
-// Revoke an entire token family (all descendants) on replay detection
-impl GrpcServer {
-    async fn revoke_token_family(&self, token_id: Uuid) -> Result<(), Status> {
-        sqlx::query(
-            r#"
-            WITH RECURSIVE token_family AS (
-                -- Start with the compromised token
-                SELECT id FROM refresh_tokens WHERE id = $1
-                UNION ALL
-                -- Find all tokens that were created from this token
-                SELECT rt.id 
-                FROM refresh_tokens rt
-                INNER JOIN token_family tf ON rt.parent_token_id = tf.id
-            )
-            UPDATE refresh_tokens
-            SET revoked_at = NOW()
-            WHERE id IN (SELECT id FROM token_family)
-            AND revoked_at IS NULL
-            "#,
-        )
-        .bind(token_id)
-        .execute(&self.db)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to revoke token family: {}", e)))?;
-
-        Ok(())
     }
 }
 
@@ -3059,6 +3451,23 @@ mod worker_tests {
         pool
     }
 
+    /// Ensure a test tenant exists and return its id
+    async fn ensure_test_tenant(pool: &Pool<Postgres>) -> Uuid {
+        let test_tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO tenants (id, domain, name, status)
+            VALUES ($1, 'test-tenant', 'Test Tenant', 'active')
+            ON CONFLICT (domain) DO NOTHING
+            "#,
+        )
+        .bind(test_tenant_id)
+        .execute(pool)
+        .await
+        .expect("create test tenant");
+        test_tenant_id
+    }
+
     async fn mk_grpc_server(pool: &Pool<Postgres>) -> GrpcServer {
         GrpcServer {
             db: pool.clone(),
@@ -3068,20 +3477,27 @@ mod worker_tests {
         }
     }
 
-    async fn mk_cluster(pool: &Pool<Postgres>, name: &str) -> Uuid {
+    async fn mk_cluster(pool: &Pool<Postgres>, tenant_id: Uuid, name: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO clusters (name, metadata) VALUES ($1, '{}') RETURNING id",
+            "INSERT INTO clusters (tenant_id, name, metadata) VALUES ($1, $2, '{}') RETURNING id",
         )
+        .bind(tenant_id)
         .bind(name)
         .fetch_one(pool)
         .await
         .expect("insert cluster")
     }
 
-    async fn mk_namespace(pool: &Pool<Postgres>, cluster_id: Uuid, name: &str) -> Uuid {
+    async fn mk_namespace(
+        pool: &Pool<Postgres>,
+        tenant_id: Uuid,
+        cluster_id: Uuid,
+        name: &str,
+    ) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO namespaces (id, name, cluster_id) VALUES (gen_random_uuid(), $1, $2) RETURNING id",
+            "INSERT INTO namespaces (id, tenant_id, name, cluster_id) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id",
         )
+        .bind(tenant_id)
         .bind(name)
         .bind(cluster_id)
         .fetch_one(pool)
@@ -3113,6 +3529,7 @@ mod worker_tests {
 
     async fn mk_manual_release(
         pool: &Pool<Postgres>,
+        tenant_id: Uuid,
         namespace_id: Uuid,
         repo_branch_id: Uuid,
         name: &str,
@@ -3120,12 +3537,13 @@ mod worker_tests {
         sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO releases (
-                id, service_id, namespace_id, hash, path, name, version, repo_branch_id, git_sha, manually_selected_at
+                id, tenant_id, service_id, namespace_id, hash, path, name, version, repo_branch_id, git_sha, manually_selected_at
             ) VALUES (
-                gen_random_uuid(), gen_random_uuid(), $1, 'h123', '/manifests/svc.yaml', $2, '1.2.3', $3, 'deadbeef', NOW()
+                gen_random_uuid(), $1, gen_random_uuid(), $2, 'h123', '/manifests/svc.yaml', $3, '1.2.3', $4, 'deadbeef', NOW()
             ) RETURNING id
             "#,
         )
+        .bind(tenant_id)
         .bind(namespace_id)
         .bind(name)
         .bind(repo_branch_id)
@@ -3137,6 +3555,7 @@ mod worker_tests {
     #[tokio::test]
     async fn get_release_returns_manual_selection() {
         let pool = test_pool().await;
+        let tenant_id = ensure_test_tenant(&pool).await;
         let server = mk_grpc_server(&pool).await;
 
         let cluster_name = "worker-test-cluster";
@@ -3146,12 +3565,12 @@ mod worker_tests {
         let branch = "main";
         let release_name = "widget-api";
 
-        let cluster_id = mk_cluster(&pool, cluster_name).await;
-        let namespace_id = mk_namespace(&pool, cluster_id, ns_name).await;
+        let cluster_id = mk_cluster(&pool, tenant_id, cluster_name).await;
+        let namespace_id = mk_namespace(&pool, tenant_id, cluster_id, ns_name).await;
         let repo_id = mk_repo(&pool, org, repo).await;
         let repo_branch_id = mk_repo_branch(&pool, repo_id, branch).await;
         let _release_id =
-            mk_manual_release(&pool, namespace_id, repo_branch_id, release_name).await;
+            mk_manual_release(&pool, tenant_id, namespace_id, repo_branch_id, release_name).await;
 
         let req = beecd::GetReleaseRequest {
             cluster_id: cluster_id.to_string(),
@@ -3435,16 +3854,22 @@ invalid syntax here [broken"#;
             .expect("migrations should run successfully");
     }
 
-    async fn insert_user(pool: &Pool<Postgres>, username: &str, password: &str) -> Uuid {
+    async fn insert_user(
+        pool: &Pool<Postgres>,
+        tenant_id: Uuid,
+        username: &str,
+        password: &str,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         // Use a low bcrypt cost for test speed
         let hash = bcrypt::hash(password, 4).expect("bcrypt hash");
         sqlx::query(
-            "INSERT INTO users (id, name, hash) VALUES ($1, $2, $3) ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash"
+            "INSERT INTO users (id, name, hash, tenant_id) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, name) DO UPDATE SET hash = EXCLUDED.hash"
         )
         .bind(id)
         .bind(username)
         .bind(hash)
+        .bind(tenant_id)
         .execute(pool)
         .await
         .expect("insert user");
@@ -3455,11 +3880,12 @@ invalid syntax here [broken"#;
     async fn login_stores_null_ip_when_remote_unknown() {
         let pool = test_pool().await;
         ensure_migrations(&pool).await;
+        let tenant_id = ensure_test_tenant(&pool).await;
         let server = mk_grpc_server(&pool).await;
 
         let username = "iptest";
         let password = "p@ssw0rd";
-        insert_user(&pool, username, password).await;
+        insert_user(&pool, tenant_id, username, password).await;
 
         let req = beecd::LoginRequest {
             username: username.to_string(),
@@ -3593,6 +4019,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = "DATABASE_PASSWORD";
     let database_password = std::env::var(key)
         .map_err(|_| format!("Environment variable {} is required but not set", key))?;
+
+    // Optional admin credentials for migrations (falls back to app user if not set)
+    // Admin user owns tables and bypasses RLS; app user is subject to RLS
+    let database_admin_user =
+        std::env::var("DATABASE_ADMIN_USER").unwrap_or_else(|_| database_user.clone());
+    let database_admin_password =
+        std::env::var("DATABASE_ADMIN_PASSWORD").unwrap_or_else(|_| database_password.clone());
+
     let dsn = format!(
         "postgres://{}:{}@{}:{}/{}",
         database_user, database_password, database_host, database_port, database_name
@@ -3601,26 +4035,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "postgres://{}:{}@{}:{}/{}",
         database_user, database_password, database_host_readonly, database_port, database_name
     );
+    let dsn_admin = format!(
+        "postgres://{}:{}@{}:{}/{}",
+        database_admin_user, database_admin_password, database_host, database_port, database_name
+    );
     let key = "GITHUB_API_URL";
     let github_api_url = std::env::var(key).unwrap_or(String::from("https://api.github.com"));
 
-    let hive_db_connection_options: PgConnectOptions = dsn
+    // Run database migrations with admin credentials (owns tables, bypasses RLS)
+    // Admin pool is only used for migrations, then closed
+    let admin_connection_options: PgConnectOptions = dsn_admin
         .parse::<PgConnectOptions>()
-        .map_err(|e| format!("Failed to parse DATABASE connection string: {}", e))?
+        .map_err(|e| format!("Failed to parse DATABASE_ADMIN connection string: {}", e))?
         .log_statements(log::LevelFilter::Trace)
         .log_slow_statements(log::LevelFilter::Debug, std::time::Duration::from_secs(1));
 
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(hive_db_connection_options.clone())
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(admin_connection_options)
         .await?;
 
     // Run database migrations with retry logic for HA deployments
     // Multiple replicas may attempt migrations concurrently; PostgreSQL
     // serializes them via locks on _sqlx_migrations table
-    info!("Running Hive database migrations...");
+    info!("Running Hive database migrations (as admin user)...");
     for attempt in 1..=5 {
-        match sqlx::migrate!("./migrations").run(&pool).await {
+        match sqlx::migrate!("./migrations").run(&admin_pool).await {
             Ok(_) => {
                 info!("Hive database migrations completed successfully");
                 break;
@@ -3640,6 +4080,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Close admin pool - not needed for runtime operations
+    admin_pool.close().await;
+    info!("Admin connection pool closed, switching to app user for runtime");
+
+    // Create app connection pool (subject to RLS)
+    let hive_db_connection_options: PgConnectOptions = dsn
+        .parse::<PgConnectOptions>()
+        .map_err(|e| format!("Failed to parse DATABASE connection string: {}", e))?
+        .log_statements(log::LevelFilter::Trace)
+        .log_slow_statements(log::LevelFilter::Debug, std::time::Duration::from_secs(1));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(hive_db_connection_options.clone())
+        .await?;
 
     let hive_db_connection_options_readonly: PgConnectOptions = dsn_readonly
         .parse::<PgConnectOptions>()
@@ -3681,7 +4137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&dsn_readonly)
         .await?;
 
-    let svc = WorkerServer::new(server);
+    // Use tonic interceptor for JWT auth and tenant context injection
+    let svc = WorkerServer::with_interceptor(server, auth::auth_interceptor);
+
+    // Keep the tower layer for cluster check-in updates (separate concern)
     let auth_layer = auth::AuthLayer::new(connection_authentication_pool);
 
     let grpc_keep_alive_in_seconds =

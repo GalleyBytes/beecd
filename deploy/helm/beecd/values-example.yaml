@@ -48,11 +48,18 @@ minio:
 
 hiveServer:
   # Database configuration (auto-configured when postgresql.enabled=true)
+  # 
+  # Two-role pattern for Row-Level Security:
+  #   - hive_admin: owns tables, runs migrations, bypasses RLS
+  #   - hive_user: app connection role, subject to RLS (non-owner)
+  #
+  # The embedded PostgreSQL initdb script creates both roles.
+  # The application connects as hive_user (subject to RLS).
   database:
     hive:
       # host is auto-configured to use embedded PostgreSQL
       # For external database, set host explicitly and set postgresql.enabled=false
-      user: hive_user
+      user: hive_user  # App user - subject to RLS
       # Use existingSecret to reference Kubernetes secret:
       # kubectl create secret generic hive-db \
       #   --from-literal=DATABASE_USER="hive_user" \

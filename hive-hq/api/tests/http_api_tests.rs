@@ -51,7 +51,7 @@ async fn test_get_clusters_with_auth() {
 
     // Create test clusters
     for _ in 0..10 {
-        create_test_cluster(&env.pool).await;
+        create_test_cluster(&env.pool, env.tenant_id).await;
     }
 
     let app = env.create_test_app();
@@ -205,6 +205,7 @@ async fn test_wrong_signature_returns_401() {
         email: "test@galleybytes.com".to_string(),
         exp: expiration.as_secs() as usize,
         roles: vec!["admin".to_string()],
+        tenant_id: env.tenant_id.to_string(),
     };
 
     let wrong_token = encode(
@@ -332,7 +333,7 @@ async fn test_get_cluster_groups_with_performance() {
     // Create 50 cluster groups with unique names
     for _ in 0..50 {
         let unique_name = format!("perf-group-{}", Uuid::new_v4());
-        create_test_cluster_group(&env.pool, &unique_name).await;
+        create_test_cluster_group(&env.pool, &unique_name, env.tenant_id).await;
     }
 
     let app = env.create_test_app();
@@ -393,7 +394,7 @@ async fn test_get_clusters_bulk_with_performance() {
     println!("Creating 200 test clusters...");
     let create_start = Instant::now();
     for _ in 0..200 {
-        create_test_cluster(&env.pool).await;
+        create_test_cluster(&env.pool, env.tenant_id).await;
     }
     let create_elapsed = create_start.elapsed();
     println!("✓ Created 200 clusters in {:?}", create_elapsed);
@@ -459,7 +460,7 @@ async fn test_delete_cluster() {
         .expect("Failed to setup test environment");
 
     // Create a test cluster
-    let cluster_id = create_test_cluster(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
 
     let app = env.create_test_app();
     let token = env

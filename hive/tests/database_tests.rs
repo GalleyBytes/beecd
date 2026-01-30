@@ -1,7 +1,7 @@
 mod common;
 
 use bcrypt::hash;
-use common::{cleanup_test_data, create_test_cluster, create_test_user, setup_test_db};
+use common::{cleanup_test_data, create_test_cluster, create_test_user, setup_test_db, get_test_tenant_id};
 use sqlx::Row;
 
 #[tokio::test]
@@ -133,10 +133,11 @@ async fn test_save_hive_error() {
     // Save an error message
     let error_message = "Test error message";
     sqlx::query(
-        "INSERT INTO hive_errors (cluster_id, message, is_deprecated) VALUES ($1, $2, false)",
+        "INSERT INTO hive_errors (cluster_id, message, is_deprecated, tenant_id) VALUES ($1, $2, false, $3)",
     )
     .bind(cluster_id)
     .bind(error_message)
+    .bind(get_test_tenant_id())
     .execute(&pool)
     .await
     .expect("Failed to save error");
@@ -170,10 +171,11 @@ async fn test_deprecate_hive_errors() {
     // Create some error messages
     for i in 0..3 {
         sqlx::query(
-            "INSERT INTO hive_errors (cluster_id, message, is_deprecated) VALUES ($1, $2, false)",
+            "INSERT INTO hive_errors (cluster_id, message, is_deprecated, tenant_id) VALUES ($1, $2, false, $3)",
         )
         .bind(cluster_id)
         .bind(format!("Error {}", i))
+        .bind(get_test_tenant_id())
         .execute(&pool)
         .await
         .expect("Failed to save error");
@@ -213,10 +215,11 @@ async fn test_cluster_metadata() {
     // Create a cluster with custom metadata
     let metadata = r#"{"region": "us-west-2", "environment": "test"}"#;
     let cluster_id = sqlx::query_scalar::<_, uuid::Uuid>(
-        "INSERT INTO clusters (name, metadata) VALUES ($1, $2) RETURNING id",
+        "INSERT INTO clusters (name, metadata, tenant_id) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(cluster_name)
     .bind(metadata)
+    .bind(get_test_tenant_id())
     .fetch_one(&pool)
     .await
     .expect("Failed to create cluster");
@@ -295,13 +298,15 @@ async fn test_concurrent_error_logging() {
 
     for i in 0..5 {
         let pool = pool.clone();
+        let tenant_id = get_test_tenant_id();
 
         let handle = tokio::spawn(async move {
             sqlx::query(
-                "INSERT INTO hive_errors (cluster_id, message, is_deprecated) VALUES ($1, $2, false)"
+                "INSERT INTO hive_errors (cluster_id, message, is_deprecated, tenant_id) VALUES ($1, $2, false, $3)"
             )
             .bind(cluster_id)
             .bind(format!("Concurrent error {}", i))
+            .bind(tenant_id)
             .execute(&pool)
             .await
             .expect("Failed to save error")
@@ -363,10 +368,11 @@ async fn test_orphan_hive_errors_cleanup() {
     // Create cluster and error
     let cluster_id = create_test_cluster(&pool, cluster_name).await;
     sqlx::query(
-        "INSERT INTO hive_errors (cluster_id, message, is_deprecated) VALUES ($1, $2, false)",
+        "INSERT INTO hive_errors (cluster_id, message, is_deprecated, tenant_id) VALUES ($1, $2, false, $3)",
     )
     .bind(cluster_id)
     .bind("Test error for cleanup")
+    .bind(get_test_tenant_id())
     .execute(&pool)
     .await
     .expect("Failed to save error");
@@ -422,10 +428,11 @@ async fn test_large_error_list_performance() {
     // Insert 100 errors
     for i in 0..100 {
         sqlx::query(
-            "INSERT INTO hive_errors (cluster_id, message, is_deprecated) VALUES ($1, $2, false)",
+            "INSERT INTO hive_errors (cluster_id, message, is_deprecated, tenant_id) VALUES ($1, $2, false, $3)",
         )
         .bind(cluster_id)
         .bind(format!("Error message {}", i))
+        .bind(get_test_tenant_id())
         .execute(&pool)
         .await
         .expect("Failed to save error");

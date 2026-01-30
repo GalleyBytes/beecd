@@ -33,7 +33,7 @@ ARG TARGETARCH
 WORKDIR /usr/src
 
 # Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock* ./
 COPY agent/Cargo.toml agent/
 COPY diff/Cargo.toml diff/
 COPY hive/Cargo.toml hive/
@@ -79,6 +79,10 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
 
 # Runtime image
 FROM scratch
+
+ARG IMAGE_SOURCE=https://github.com/galleybytes/beecd
+LABEL org.opencontainers.image.source=${IMAGE_SOURCE}
+
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=builder /usr/local/bin/hivehq /usr/local/bin/hivehq
 COPY --from=ui-builder /ui/dist dist

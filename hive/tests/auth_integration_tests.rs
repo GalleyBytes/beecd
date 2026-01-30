@@ -1,7 +1,7 @@
 mod common;
 
 use bcrypt::hash;
-use common::{cleanup_test_data, create_test_user, setup_test_db};
+use common::{cleanup_test_data, create_test_user, setup_test_db, get_test_tenant_id};
 
 #[tokio::test]
 async fn test_auth_basic_user_lookup() {
@@ -57,9 +57,10 @@ async fn test_auth_cluster_check_in_updates_timestamp() {
     let cluster_name = "auth-test-checkin";
 
     let cluster_id = sqlx::query_scalar::<_, uuid::Uuid>(
-        "INSERT INTO clusters (name, metadata) VALUES ($1, '{}') RETURNING id",
+        "INSERT INTO clusters (name, metadata, tenant_id) VALUES ($1, '{}', $2) RETURNING id",
     )
     .bind(cluster_name)
+    .bind(get_test_tenant_id())
     .fetch_one(&pool)
     .await
     .expect("Failed to create cluster");
@@ -105,9 +106,10 @@ async fn test_auth_concurrent_check_in_updates() {
     let cluster_name = "auth-test-concurrent";
 
     let cluster_id = sqlx::query_scalar::<_, uuid::Uuid>(
-        "INSERT INTO clusters (name, metadata) VALUES ($1, '{}') RETURNING id",
+        "INSERT INTO clusters (name, metadata, tenant_id) VALUES ($1, '{}', $2) RETURNING id",
     )
     .bind(cluster_name)
+    .bind(get_test_tenant_id())
     .fetch_one(&pool)
     .await
     .expect("Failed to create cluster");

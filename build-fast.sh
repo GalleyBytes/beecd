@@ -261,26 +261,16 @@ build_binary() {
 }
 
 #######################################
-# Build hive-hq UI and docs (requires npm and zola)
+# Build hive-hq UI (requires npm)
 #######################################
 build_hive_hq_assets() {
-    log_info "Building hive-hq UI and docs..."
+    log_info "Building hive-hq UI..."
     
     # Check for npm
     if ! command -v npm &>/dev/null; then
         log_error "npm not found. Please install Node.js: https://nodejs.org"
         exit 1
     fi
-    
-    # Check for zola
-    if ! command -v zola &>/dev/null; then
-        log_error "zola not found. Please install: brew install zola"
-        exit 1
-    fi
-    
-    # Build docs with zola
-    log_info "Building docs with zola..."
-    (cd hive-hq/docs && zola build --output-dir ../dist-docs --force)
     
     # Build UI with npm/vite (React)
     log_info "Building UI with npm (React/Vite)..."
@@ -290,7 +280,7 @@ build_hive_hq_assets() {
     rm -rf hive-hq/dist
     cp -r hive-hq/ui/dist hive-hq/dist
     
-    log_success "UI and docs built"
+    log_success "UI built"
 }
 
 #######################################
@@ -327,13 +317,12 @@ create_docker_image() {
     local tmp_dockerfile=$(mktemp)
     
     if [[ "$service" == "hive-hq" ]]; then
-        # hive-hq needs UI assets and docs
+        # hive-hq needs UI assets
         cat > "$tmp_dockerfile" <<EOF
 FROM alpine:3.19.1
 RUN apk add --no-cache ca-certificates
 COPY ${binary_name} /usr/local/bin/${binary_name}
 COPY dist dist
-COPY dist-docs dist-docs
 CMD ["${binary_name}"]
 EOF
     else
@@ -357,7 +346,7 @@ EOF
     cp "$binary_path" "$tmp_dir/${binary_name}"
     cp "$tmp_dockerfile" "$tmp_dir/Dockerfile"
     
-    # For hive-hq, also copy UI and docs assets
+    # For hive-hq, also copy UI assets
     if [[ "$service" == "hive-hq" ]]; then
         if [[ ! -d "hive-hq/dist" ]]; then
             log_error "UI dist not found. Run build_hive_hq_assets first."
@@ -365,7 +354,6 @@ EOF
             return 1
         fi
         cp -r hive-hq/dist "$tmp_dir/dist"
-        cp -r hive-hq/dist-docs "$tmp_dir/dist-docs"
     fi
     
     # Build the minimal image
