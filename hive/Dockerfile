@@ -2,30 +2,44 @@
 # =============================================================================
 # Optimized Hive Dockerfile with BuildKit cache mounts
 # =============================================================================
-FROM rust:1.92.0 AS builder
+FROM --platform=$BUILDPLATFORM rust:1.92.0 AS builder
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
-  musl-tools protobuf-compiler linux-libc-dev wget ca-certificates \
+  musl-tools protobuf-compiler linux-libc-dev wget ca-certificates gcc-aarch64-linux-gnu \
   && rm -rf /var/lib/apt/lists/*
 
-# Setup musl include paths
+# Setup musl include paths for both architectures
 RUN mkdir -p /usr/include/x86_64-linux-musl && \
   ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm && \
   ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
   ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+
+RUN mkdir -p /usr/include/aarch64-linux-musl && \
+  ln -sf /usr/include/aarch64-linux-gnu/asm /usr/include/aarch64-linux-musl/asm && \
+  ln -sf /usr/include/asm-generic /usr/include/aarch64-linux-musl/asm-generic && \
+  ln -sf /usr/include/linux /usr/include/aarch64-linux-musl/linux
 
 # Build OpenSSL (cached as a layer)
 WORKDIR /musl
 RUN wget -q https://github.com/openssl/openssl/archive/OpenSSL_1_1_1f.tar.gz && \
   tar xzf OpenSSL_1_1_1f.tar.gz && \
   cd openssl-OpenSSL_1_1_1f && \
-  CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64 && \
+  if [ "$TARGETARCH" = "arm64" ]; then \
+    CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-aarch64; \
+  else \
+    CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64; \
+  fi && \
   make depend && make -j$(nproc) && make install && \
   rm -rf /musl/OpenSSL_1_1_1f.tar.gz /musl/openssl-OpenSSL_1_1_1f
 
 # Setup Rust target
 WORKDIR /usr/src
-RUN rustup target add x86_64-unknown-linux-musl
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -46,11 +60,19 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
 
 ENV OPENSSL_DIR=/musl
 
+# Determine Rust target based on architecture
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        echo "aarch64-unknown-linux-musl" > /rust-target; \
+    else \
+        echo "x86_64-unknown-linux-musl" > /rust-target; \
+    fi
+
 # Pre-build dependencies with cache mounts
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
   --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
   --mount=type=cache,target=/usr/src/target,id=beecd-target \
-  cargo build --release --target x86_64-unknown-linux-musl -p hive 2>/dev/null || true
+  export RUST_TARGET=$(cat /rust-target) && \
+  cargo build --release --target $RUST_TARGET -p hive 2>/dev/null || true
 
 # Copy real source files
 COPY agent/src ./agent/src
@@ -66,18 +88,27 @@ ARG BUILD_VERSION
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 # Build final binary
-RUN cargo build --release --target x86_64-unknown-linux-musl -p hive && \
-  cp /usr/src/target/x86_64-unknown-linux-musl/release/hive /usr/local/bin/hive
+RUN export RUST_TARGET=$(cat /rust-target) && \
+  cargo build --release --target $RUST_TARGET -p hive && \
+  cp /usr/src/target/$RUST_TARGET/release/hive /usr/local/bin/hive
 
 # Fetch sops binary
-FROM alpine:3.19.1 AS sops
+FROM --platform=$TARGETPLATFORM alpine:3.19.1 AS sops
+
+ARG TARGETARCH
+
 RUN apk add --no-cache curl && \
-  curl -LO https://github.com/getsops/sops/releases/download/v3.8.1/sops-v3.8.1.linux.amd64 && \
-  mv sops-v3.8.1.linux.amd64 /usr/local/bin/sops && \
+  if [ "$TARGETARCH" = "arm64" ]; then \
+    curl -LO https://github.com/getsops/sops/releases/download/v3.8.1/sops-v3.8.1.linux.arm64 && \
+    mv sops-v3.8.1.linux.arm64 /usr/local/bin/sops; \
+  else \
+    curl -LO https://github.com/getsops/sops/releases/download/v3.8.1/sops-v3.8.1.linux.amd64 && \
+    mv sops-v3.8.1.linux.amd64 /usr/local/bin/sops; \
+  fi && \
   chmod +x /usr/local/bin/sops
 
 # Runtime image
-FROM alpine:3.19.1
+FROM --platform=$TARGETPLATFORM alpine:3.19.1
 RUN apk add --no-cache gpg gpg-agent ca-certificates
 COPY --from=builder /usr/local/bin/hive /usr/local/bin/hive
 COPY --from=sops /usr/local/bin/sops /usr/local/bin/sops

@@ -4,7 +4,7 @@
 # =============================================================================
 
 # Stage 1: Build the React UI with Node.js
-FROM node:22-bookworm-slim AS ui-builder
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS ui-builder
 
 WORKDIR /ui
 COPY hive-hq/ui/package.json hive-hq/ui/package-lock.json ./
@@ -15,30 +15,44 @@ COPY hive-hq/ui ./
 RUN npm run build
 
 # Stage 2: Build Rust API binary
-FROM rust:1.92.0 AS builder
+FROM --platform=$BUILDPLATFORM rust:1.92.0 AS builder
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    musl-tools wget ca-certificates linux-libc-dev \
+    musl-tools wget ca-certificates linux-libc-dev gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
-# Setup musl include paths
+# Setup musl include paths for both architectures
 RUN mkdir -p /usr/include/x86_64-linux-musl && \
     ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm && \
     ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
     ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+
+RUN mkdir -p /usr/include/aarch64-linux-musl && \
+    ln -sf /usr/include/aarch64-linux-gnu/asm /usr/include/aarch64-linux-musl/asm && \
+    ln -sf /usr/include/asm-generic /usr/include/aarch64-linux-musl/asm-generic && \
+    ln -sf /usr/include/linux /usr/include/aarch64-linux-musl/linux
 
 # Build OpenSSL (cached as a layer)
 WORKDIR /musl
 RUN wget -q https://github.com/openssl/openssl/archive/OpenSSL_1_1_1f.tar.gz && \
     tar xzf OpenSSL_1_1_1f.tar.gz && \
     cd openssl-OpenSSL_1_1_1f && \
-    CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64 && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-aarch64; \
+    else \
+        CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64; \
+    fi && \
     make depend && make -j$(nproc) && make install && \
     rm -rf /musl/OpenSSL_1_1_1f.tar.gz /musl/openssl-OpenSSL_1_1_1f
 
 # Setup Rust targets
 WORKDIR /usr/src
-RUN rustup target add x86_64-unknown-linux-musl
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -59,11 +73,19 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
 
 ENV OPENSSL_DIR=/musl
 
+# Determine Rust target based on architecture
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        echo "aarch64-unknown-linux-musl" > /rust-target; \
+    else \
+        echo "x86_64-unknown-linux-musl" > /rust-target; \
+    fi
+
 # Pre-build dependencies with cache mounts
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/target,id=beecd-target \
-    cargo build --release --target x86_64-unknown-linux-musl -p api 2>/dev/null || true
+    export RUST_TARGET=$(cat /rust-target) && \
+    cargo build --release --target $RUST_TARGET -p api 2>/dev/null || true
 
 # Copy real source files
 COPY hive-hq/api/src ./hive-hq/api/src
@@ -74,11 +96,12 @@ COPY hive/proto ./hive/proto
 ARG BUILD_VERSION
 ENV BUILD_VERSION=${BUILD_VERSION}
 
-RUN cargo build --release --target x86_64-unknown-linux-musl -p api && \
-    cp /usr/src/target/x86_64-unknown-linux-musl/release/api /usr/local/bin/hivehq
+RUN export RUST_TARGET=$(cat /rust-target) && \
+    cargo build --release --target $RUST_TARGET -p api && \
+    cp /usr/src/target/$RUST_TARGET/release/api /usr/local/bin/hivehq
 
 # Runtime image
-FROM scratch
+FROM --platform=$TARGETPLATFORM scratch
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=builder /usr/local/bin/hivehq /usr/local/bin/hivehq
 COPY --from=ui-builder /ui/dist dist
