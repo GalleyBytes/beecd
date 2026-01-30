@@ -40,8 +40,7 @@ RUN apt-get update && \
 
 # Configure OpenSSL for musl static linking with vendored source compilation
 ENV OPENSSL_STATIC=yes \
-    OPENSSL_VENDORED=yes \
-    OPENSSL_NO_PKG_CONFIG=1
+    OPENSSL_VENDORED=yes
 
 WORKDIR /usr/src
 
