@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Optimized Hive-HQ Dockerfile with BuildKit cache mounts
+# Optimized Hive-HQ Dockerfile - Multi-arch support
+# =============================================================================
+# Supports linux/amd64 and linux/arm64
 # =============================================================================
 
 # Stage 1: Build the React UI with Node.js
@@ -14,44 +16,16 @@ RUN --mount=type=cache,target=/root/.npm,id=npm-cache \
 COPY hive-hq/ui ./
 RUN npm run build
 
-# Stage 2: Build Rust API binary
-FROM rust:1.92.0 AS builder
+# Stage 2: Build Rust API binary using rust-musl-cross
+# Use different base images based on target architecture
+FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
+FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
-ARG TARGETPLATFORM
-ARG TARGETOS
+# Select the appropriate builder based on TARGETARCH
 ARG TARGETARCH
+FROM builder-${TARGETARCH} AS builder
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    musl-tools wget ca-certificates linux-libc-dev gcc-aarch64-linux-gnu \
-    && rm -rf /var/lib/apt/lists/*
-
-# Setup musl include paths for both architectures
-RUN mkdir -p /usr/include/x86_64-linux-musl && \
-    ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm && \
-    ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
-    ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
-
-RUN mkdir -p /usr/include/aarch64-linux-musl && \
-    ln -sf /usr/include/aarch64-linux-gnu/asm /usr/include/aarch64-linux-musl/asm && \
-    ln -sf /usr/include/asm-generic /usr/include/aarch64-linux-musl/asm-generic && \
-    ln -sf /usr/include/linux /usr/include/aarch64-linux-musl/linux
-
-# Build OpenSSL (cached as a layer)
-WORKDIR /musl
-RUN wget -q https://github.com/openssl/openssl/archive/OpenSSL_1_1_1f.tar.gz && \
-    tar xzf OpenSSL_1_1_1f.tar.gz && \
-    cd openssl-OpenSSL_1_1_1f && \
-    if [ "$TARGETARCH" = "arm64" ]; then \
-        CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-aarch64; \
-    else \
-        CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64; \
-    fi && \
-    make depend && make -j$(nproc) && make install && \
-    rm -rf /musl/OpenSSL_1_1_1f.tar.gz /musl/openssl-OpenSSL_1_1_1f
-
-# Setup Rust targets
 WORKDIR /usr/src
-RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -70,8 +44,6 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
     mkdir -p hive-hq/api/src && echo 'fn main() {}' > hive-hq/api/src/main.rs && touch hive-hq/api/src/lib.rs && \
     mkdir -p storage/src && touch storage/src/lib.rs
 
-ENV OPENSSL_DIR=/musl
-
 # Determine Rust target based on architecture
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         echo "aarch64-unknown-linux-musl" > /rust-target; \
@@ -80,8 +52,8 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
     fi
 
 # Pre-build dependencies with cache mounts
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/root/.cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/target,id=beecd-target \
     export RUST_TARGET=$(cat /rust-target) && \
     cargo build --release --target $RUST_TARGET -p api 2>/dev/null || true
