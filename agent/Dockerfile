@@ -1,59 +1,28 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Optimized Agent Dockerfile - Uses BuildKit cache mounts
+# Optimized Agent Dockerfile - Multi-arch support
 # =============================================================================
-# Key optimizations:
-# 1. Uses BuildKit cache mounts for Cargo registry and target dirs
-# 2. Builds natively on host arch, then cross-compiles only the final binary
-# 3. Leverages pre-built base image for OpenSSL
+# Supports linux/amd64 and linux/arm64 using rust-musl-cross base images
 # =============================================================================
 
-ARG RUST_VERSION=1.89.0
-ARG ALPINE_VERSION=3.19.1
+# Declare TARGETARCH at the top level
+ARG TARGETARCH
 
-# =============================================================================
-# Stage 1: Build OpenSSL for musl (cached layer)
-# =============================================================================
-FROM rust:${RUST_VERSION} AS openssl-builder
+# Use different base images based on target architecture
+FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
+FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    musl-tools wget ca-certificates linux-libc-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Select the appropriate builder based on TARGETARCH
+FROM builder-${TARGETARCH} AS builder
 
-RUN mkdir -p /usr/include/x86_64-linux-musl && \
-    ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm && \
-    ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
-    ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+# Redeclare ARG after FROM
+ARG TARGETARCH
 
-WORKDIR /musl
-RUN wget -q https://github.com/openssl/openssl/archive/OpenSSL_1_1_1f.tar.gz && \
-    tar xzf OpenSSL_1_1_1f.tar.gz && \
-    cd openssl-OpenSSL_1_1_1f && \
-    CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64 && \
-    make depend && \
-    make -j$(nproc) && \
-    make install
-
-# =============================================================================
-# Stage 2: Build dependencies (cached layer)
-# =============================================================================
-FROM rust:${RUST_VERSION} AS deps-builder
-
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    musl-tools protobuf-compiler linux-libc-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Setup musl include paths
-RUN mkdir -p /usr/include/x86_64-linux-musl && \
-    ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm && \
-    ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
-    ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
-
-RUN rustup target add x86_64-unknown-linux-musl
-
-# Copy pre-built OpenSSL
-COPY --from=openssl-builder /musl /musl
-ENV OPENSSL_DIR=/musl
+# Install protobuf compiler and update CA certificates
+RUN apt-get update && \
+    apt-get install -y protobuf-compiler ca-certificates && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src
 
@@ -74,16 +43,20 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
     mkdir -p diff/src && touch diff/src/lib.rs && \
     mkdir -p storage/src && touch storage/src/lib.rs
 
-# Build dependencies with cache mount
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/usr/src/target,id=agent-target \
-    cargo build --release --target x86_64-unknown-linux-musl -p agent 2>/dev/null || true
+# Set Rust target as environment variable based on architecture
+ENV RUST_TARGET=${TARGETARCH:+$(test "$TARGETARCH" = "arm64" && echo "aarch64-unknown-linux-musl" || echo "x86_64-unknown-linux-musl")}
+RUN echo "Building for architecture: $TARGETARCH, target: $RUST_TARGET"
 
-# =============================================================================
-# Stage 3: Build actual binary
-# =============================================================================
-FROM deps-builder AS builder
+# Build dependencies with architecture-specific cache mounts
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
+    --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
+    --mount=type=cache,target=/usr/src/target,id=agent-target-${TARGETARCH} \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        RUST_TARGET="aarch64-unknown-linux-musl"; \
+    else \
+        RUST_TARGET="x86_64-unknown-linux-musl"; \
+    fi && \
+    cargo build --release --target $RUST_TARGET -p agent 2>/dev/null || true
 
 # Copy real source files
 COPY agent/src ./agent/src
@@ -98,11 +71,16 @@ ARG BUILD_VERSION
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 # Build final binary
-RUN cargo build --release --target x86_64-unknown-linux-musl -p agent && \
-    cp /usr/src/target/x86_64-unknown-linux-musl/release/agent /usr/local/bin/agent
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        RUST_TARGET="aarch64-unknown-linux-musl"; \
+    else \
+        RUST_TARGET="x86_64-unknown-linux-musl"; \
+    fi && \
+    cargo build --release --target $RUST_TARGET -p agent && \
+    cp /usr/src/target/$RUST_TARGET/release/agent /usr/local/bin/agent
 
 # =============================================================================
-# Stage 4: Runtime image
+# Runtime image
 # =============================================================================
 FROM scratch
 
