@@ -185,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = Agent::new(
         grpc_client,
+        grpc_client_for_login,
         k8s_client,
         owner,
         cluster_name,

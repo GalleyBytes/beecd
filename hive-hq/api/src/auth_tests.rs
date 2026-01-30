@@ -17,6 +17,7 @@ mod tests {
             email: "test@example.com".to_string(),
             exp: expiration.as_secs() as usize,
             roles: vec!["admin".to_string(), "aversion".to_string()],
+            tenant_id: String::new(),
         };
 
         assert_eq!(claim.roles.len(), 2);
@@ -34,6 +35,7 @@ mod tests {
             email: "admin@galleybytes.com".to_string(),
             exp: expiration.as_secs() as usize,
             roles: vec!["admin".to_string()],
+            tenant_id: String::new(),
         };
 
         let token = encode(
@@ -68,6 +70,7 @@ mod tests {
             email: "aversion@galleybytes.com".to_string(),
             exp: expiration.as_secs() as usize,
             roles: vec!["aversion".to_string()],
+            tenant_id: String::new(),
         };
 
         let token = encode(
@@ -103,6 +106,7 @@ mod tests {
                 "aversion".to_string(),
                 "operator".to_string(),
             ],
+            tenant_id: String::new(),
         };
 
         let token = encode(

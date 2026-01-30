@@ -5,7 +5,7 @@ use axum::{
     Router,
 };
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use types::Claim;
@@ -15,6 +15,8 @@ pub struct TestEnvironment {
     pub namespace: String,
     pub pool: PgPool,
     pub jwt_secret: String,
+    pub tenant_id: Uuid,
+    pub tenant_subdomain: String,
 }
 
 impl TestEnvironment {
@@ -47,13 +49,44 @@ impl TestEnvironment {
         let jwt_secret =
             "test_jwt_secret_for_integration_tests_minimum_length_required".to_string();
 
-        println!("✓ Test environment ready");
+        // Create test tenant for isolation
+        let tenant_id = Uuid::new_v4();
+        let tenant_subdomain = format!("test-{}", &tenant_id.to_string()[..8]);
+
+        sqlx::query(
+            r#"
+            INSERT INTO tenants (id, name, domain)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (domain) DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&format!("Test Tenant {}", tenant_subdomain))
+        .bind(&tenant_subdomain)
+        .execute(&pool)
+        .await?;
+
+        println!("Created test tenant: {} ({})", tenant_subdomain, tenant_id);
+        println!("Test environment ready");
 
         Ok(Self {
             namespace,
             pool,
             jwt_secret,
+            tenant_id,
+            tenant_subdomain,
         })
+    }
+
+    /// Set tenant context for RLS policies. Call this before any tenant-scoped queries.
+    pub async fn set_tenant_context<'e, E>(&self, executor: E) -> Result<(), sqlx::Error>
+    where
+        E: Executor<'e, Database = sqlx::Postgres>,
+    {
+        sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", self.tenant_id))
+            .execute(executor)
+            .await?;
+        Ok(())
     }
 
     pub async fn cleanup(self) {
@@ -74,6 +107,7 @@ impl TestEnvironment {
             email: email.to_string(),
             exp: expiration.as_secs() as usize,
             roles: vec!["admin".to_string()],
+            tenant_id: self.tenant_id.to_string(),
         };
 
         let token = encode(
@@ -92,6 +126,7 @@ impl TestEnvironment {
             email: email.to_string(),
             exp: expiration.as_secs() as usize,
             roles: vec!["admin".to_string()],
+            tenant_id: self.tenant_id.to_string(),
         };
 
         let token = encode(
@@ -109,6 +144,9 @@ impl TestEnvironment {
         // Import the handler module from the main crate
         use api::handler;
         use api::ServerState;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
         use tower_http::cors::{Any, CorsLayer};
 
         let server_state = ServerState {
@@ -117,12 +155,12 @@ impl TestEnvironment {
             agent_manifest_template: "test-template".to_string(),
             agent_default_image: Some("test-image:latest".to_string()),
             hive_default_grpc_server: Some("test-grpc:50051".to_string()),
+            hive_default_grpc_tls: Some(false),
             version: "test-1.0.0".to_string(),
-            gh_token: "test-token".to_string(),
-            github_api_url: "https://api.github.com".to_string(),
             jwt_secret_bytes: self.jwt_secret.clone().into_bytes(),
             read_replica_wait_in_ms: 0, // No wait for tests
             github_webhook_callback_url: None,
+            secret_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let cors = CorsLayer::new().allow_origin(Any);
@@ -229,55 +267,58 @@ impl TestEnvironment {
     }
 }
 
-// Test fixture helpers
-pub async fn create_test_cluster(pool: &PgPool) -> Uuid {
+// Test fixture helpers - all require tenant context set first
+pub async fn create_test_cluster(pool: &PgPool, tenant_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     let name = format!("test-cluster-{}", Uuid::new_v4());
     sqlx::query(
         r#"
-        INSERT INTO clusters (id, name, metadata, version, kubernetes_version)
-        VALUES ($1, $2, 'test', '1.0', '1.28')
+        INSERT INTO clusters (id, name, metadata, version, kubernetes_version, tenant_id)
+        VALUES ($1, $2, 'test', '1.0', '1.28', $3)
         "#,
     )
     .bind(id)
     .bind(name)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test cluster");
     id
 }
 
-pub async fn create_test_namespace(pool: &PgPool, cluster_id: Uuid) -> Uuid {
+pub async fn create_test_namespace(pool: &PgPool, cluster_id: Uuid, tenant_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     let name = format!("test-namespace-{}", Uuid::new_v4());
     sqlx::query(
         r#"
-        INSERT INTO namespaces (id, name, cluster_id)
-        VALUES ($1, $2, $3)
+        INSERT INTO namespaces (id, name, cluster_id, tenant_id)
+        VALUES ($1, $2, $3, $4)
         "#,
     )
     .bind(id)
     .bind(name)
     .bind(cluster_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test namespace");
     id
 }
 
-pub async fn create_test_repo(pool: &PgPool) -> (Uuid, Uuid) {
+pub async fn create_test_repo(pool: &PgPool, tenant_id: Uuid) -> (Uuid, Uuid) {
     let repo_id = Uuid::new_v4();
     let org = format!("test-org-{}", Uuid::new_v4());
     let repo = format!("test-repo-{}", Uuid::new_v4());
     sqlx::query(
         r#"
-        INSERT INTO repos (id, org, repo)
-        VALUES ($1, $2, $3)
+        INSERT INTO repos (id, org, repo, tenant_id)
+        VALUES ($1, $2, $3, $4)
         "#,
     )
     .bind(repo_id)
     .bind(&org)
     .bind(&repo)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test repo");
@@ -285,12 +326,13 @@ pub async fn create_test_repo(pool: &PgPool) -> (Uuid, Uuid) {
     let branch_id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO repo_branches (id, branch, repo_id)
-        VALUES ($1, 'main', $2)
+        INSERT INTO repo_branches (id, branch, repo_id, tenant_id)
+        VALUES ($1, 'main', $2, $3)
         "#,
     )
     .bind(branch_id)
     .bind(repo_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test repo branch");
@@ -302,33 +344,36 @@ pub async fn create_test_service_definition(
     pool: &PgPool,
     repo_branch_id: Uuid,
     name: &str,
+    tenant_id: Uuid,
 ) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO service_definitions (id, name, repo_branch_id, source_branch_requirements)
-        VALUES ($1, $2, $3, '[]')
+        INSERT INTO service_definitions (id, name, repo_branch_id, source_branch_requirements, tenant_id)
+        VALUES ($1, $2, $3, '[]', $4)
         "#,
     )
     .bind(id)
     .bind(name)
     .bind(repo_branch_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test build target");
     id
 }
 
-pub async fn create_test_cluster_group(pool: &PgPool, name: &str) -> Uuid {
+pub async fn create_test_cluster_group(pool: &PgPool, name: &str, tenant_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO cluster_groups (id, name)
-        VALUES ($1, $2)
+        INSERT INTO cluster_groups (id, name, tenant_id)
+        VALUES ($1, $2, $3)
         "#,
     )
     .bind(id)
     .bind(name)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test cluster group");
@@ -340,21 +385,23 @@ pub async fn create_test_release(
     namespace_id: Uuid,
     repo_branch_id: Uuid,
     name: &str,
+    tenant_id: Uuid,
 ) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO releases (
             id, namespace_id, name, path, repo_branch_id,
-            hash, version, git_sha
+            hash, version, git_sha, tenant_id
         )
-        VALUES ($1, $2, $3, '/test/path', $4, 'hash123', 'v1.0', 'abc123')
+        VALUES ($1, $2, $3, '/test/path', $4, 'hash123', 'v1.0', 'abc123', $5)
         "#,
     )
     .bind(id)
     .bind(namespace_id)
     .bind(name)
     .bind(repo_branch_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .expect("Failed to create test release");
@@ -362,13 +409,13 @@ pub async fn create_test_release(
 }
 
 // Bulk fixture creation for performance testing
-pub async fn create_bulk_fixtures(pool: &PgPool, count: usize) -> BulkFixtures {
+pub async fn create_bulk_fixtures(pool: &PgPool, count: usize, tenant_id: Uuid) -> BulkFixtures {
     println!("Creating {} bulk test fixtures...", count);
 
     // Create base cluster and repo
-    let cluster_id = create_test_cluster(pool).await;
-    let namespace_id = create_test_namespace(pool, cluster_id).await;
-    let (repo_id, branch_id) = create_test_repo(pool).await;
+    let cluster_id = create_test_cluster(pool, tenant_id).await;
+    let namespace_id = create_test_namespace(pool, cluster_id, tenant_id).await;
+    let (repo_id, branch_id) = create_test_repo(pool, tenant_id).await;
 
     let mut service_definition_ids = Vec::new();
     let mut release_ids = Vec::new();
@@ -376,15 +423,22 @@ pub async fn create_bulk_fixtures(pool: &PgPool, count: usize) -> BulkFixtures {
     // Batch create build targets and releases
     for i in 0..count {
         let bt_id =
-            create_test_service_definition(pool, branch_id, &format!("service-{}", i)).await;
+            create_test_service_definition(pool, branch_id, &format!("service-{}", i), tenant_id)
+                .await;
         service_definition_ids.push(bt_id);
 
-        let rel_id =
-            create_test_release(pool, namespace_id, branch_id, &format!("release-{}", i)).await;
+        let rel_id = create_test_release(
+            pool,
+            namespace_id,
+            branch_id,
+            &format!("release-{}", i),
+            tenant_id,
+        )
+        .await;
         release_ids.push(rel_id);
     }
 
-    println!("✓ Created {} build targets and releases", count);
+    println!("Created {} build targets and releases", count);
 
     BulkFixtures {
         cluster_id,

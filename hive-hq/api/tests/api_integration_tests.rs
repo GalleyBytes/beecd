@@ -17,7 +17,7 @@ async fn test_get_clusters_with_bulk_data() {
     // Create 200 test clusters
     let mut cluster_ids = Vec::new();
     for _i in 0..200 {
-        let id = create_test_cluster(&env.pool).await;
+        let id = create_test_cluster(&env.pool, env.tenant_id).await;
         cluster_ids.push(id);
     }
 
@@ -56,7 +56,7 @@ async fn test_post_cluster_group_with_auth() {
 
     // Create a cluster group
     let group_name = format!("test-group-{}", Uuid::new_v4());
-    let group_id = create_test_cluster_group(&env.pool, &group_name).await;
+    let group_id = create_test_cluster_group(&env.pool, &group_name, env.tenant_id).await;
 
     // Verify it was created
     let result: (Uuid, String) =
@@ -85,8 +85,8 @@ async fn test_put_service_definition_update() {
         .expect("Failed to generate JWT");
 
     // Create test data
-    let (_, branch_id) = create_test_repo(&env.pool).await;
-    let bt_id = create_test_service_definition(&env.pool, branch_id, "original-name").await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
+    let bt_id = create_test_service_definition(&env.pool, branch_id, "original-name", env.tenant_id).await;
 
     // Update the build target
     let new_name = format!("updated-name-{}", Uuid::new_v4());
@@ -123,7 +123,7 @@ async fn test_delete_cluster_group() {
 
     // Create a cluster group
     let group_name = format!("test-group-{}", Uuid::new_v4());
-    let group_id = create_test_cluster_group(&env.pool, &group_name).await;
+    let group_id = create_test_cluster_group(&env.pool, &group_name, env.tenant_id).await;
 
     // Verify it exists
     let count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cluster_groups WHERE id = $1")
@@ -163,7 +163,7 @@ async fn test_authentication_failure() {
     // but would fail at API level (not testing full API stack here)
 
     // Create data without auth to verify DB operations work
-    let cluster_id = create_test_cluster(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
 
     let result: (Uuid,) = sqlx::query_as("SELECT id FROM clusters WHERE id = $1")
         .bind(cluster_id)
@@ -184,7 +184,7 @@ async fn test_bulk_operations_with_300_entries() {
         .await
         .expect("Failed to setup test environment");
 
-    let fixtures = create_bulk_fixtures(&env.pool, 300).await;
+    let fixtures = create_bulk_fixtures(&env.pool, 300, env.tenant_id).await;
 
     assert_eq!(fixtures.service_definition_ids.len(), 300);
     assert_eq!(fixtures.release_ids.len(), 300);
@@ -231,7 +231,7 @@ async fn test_complex_query_with_joins() {
         .await
         .expect("Failed to setup test environment");
 
-    let fixtures = create_bulk_fixtures(&env.pool, 100).await;
+    let fixtures = create_bulk_fixtures(&env.pool, 100, env.tenant_id).await;
 
     // Complex query joining multiple tables
     let results: Vec<(Uuid, String, String)> = sqlx::query_as(
@@ -274,8 +274,8 @@ async fn test_data_integrity_after_crud_operations() {
         .expect("Failed to generate JWT");
 
     // CREATE
-    let (_, branch_id) = create_test_repo(&env.pool).await;
-    let bt_id = create_test_service_definition(&env.pool, branch_id, "test-service").await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
+    let bt_id = create_test_service_definition(&env.pool, branch_id, "test-service", env.tenant_id).await;
 
     // READ
     let read_result: (String,) =
@@ -333,7 +333,8 @@ async fn test_concurrent_operations() {
     let mut tasks = Vec::new();
     for _ in 0..50 {
         let pool = env.pool.clone();
-        let task = tokio::spawn(async move { create_test_cluster(&pool).await });
+        let tenant_id = env.tenant_id;
+        let task = tokio::spawn(async move { create_test_cluster(&pool, tenant_id).await });
         tasks.push(task);
     }
 

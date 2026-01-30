@@ -5,7 +5,8 @@ type AlertType = 'success' | 'error' | 'warning' | 'info';
 interface AlertProps {
     type: AlertType;
     title?: string;
-    message: string;
+    message?: string;
+    children?: React.ReactNode;
     onDismiss?: () => void;
 }
 
@@ -36,7 +37,7 @@ const alertStyles: Record<AlertType, { bg: string; border: string; text: string;
     },
 };
 
-export function Alert({ type, title, message, onDismiss }: AlertProps) {
+export function Alert({ type, title, message, children, onDismiss }: AlertProps) {
     const styles = alertStyles[type];
     const Icon = styles.icon;
 
@@ -48,7 +49,8 @@ export function Alert({ type, title, message, onDismiss }: AlertProps) {
                 </div>
                 <div className="ml-3 flex-1">
                     {title && <h3 className={`text-sm font-medium ${styles.text}`}>{title}</h3>}
-                    <p className={`text-sm ${styles.text} ${title ? 'mt-1' : ''}`}>{message}</p>
+                    {message && <p className={`text-sm ${styles.text} ${title ? 'mt-1' : ''}`}>{message}</p>}
+                    {children && <div className={`${styles.text} ${title ? 'mt-1' : ''}`}>{children}</div>}
                 </div>
                 {onDismiss && (
                     <div className="ml-auto pl-3">

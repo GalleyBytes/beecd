@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { ArrowLeft, RefreshCw, Server, Layers, AlertTriangle, Activity, Trash2, Plus, FileCode, X, Package, Eye, GitCompare } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Server, Layers, AlertTriangle, Activity, Trash2, FileCode, X, Package, Eye, GitCompare } from 'lucide-react';
 import { PageHeader, DataTable, Alert, Modal, ConfirmModal } from '@/components';
 import {
     useCluster,
@@ -798,6 +798,7 @@ export function ClusterDetailPage() {
                 namespaceId: editingNamespace.namespace_id,
                 serviceDefinitionIds
             });
+            setEditingNamespace(null);
             refetchNamespaces();
             refetchReleases();
         } catch (err) {
@@ -812,7 +813,14 @@ export function ClusterDetailPage() {
                 namespaceId: editingNamespace.namespace_id,
                 serviceName
             });
-            setEditingNamespace(null);
+            // Update the local editingNamespace state to reflect the removal
+            setEditingNamespace(prev => {
+                if (!prev) return null;
+                return {
+                    ...prev,
+                    service_names: (prev.service_names ?? []).filter(name => name !== serviceName)
+                };
+            });
             refetchNamespaces();
             refetchReleases();
         } catch (err) {
@@ -1248,6 +1256,68 @@ export function ClusterDetailPage() {
                 </div>
             )}
 
+            {/* Releases Section */}
+            <div className="bg-white dark:bg-gray-800 shadow rounded-lg overflow-hidden">
+                <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+                    <div className="flex items-center justify-between">
+                        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">
+                            Releases ({releases.length})
+                        </h3>
+                    </div>
+                </div>
+                <DataTable
+                    data={releases}
+                    columns={releaseColumns}
+                    keyExtractor={(r) => r.data.id}
+                    isLoading={loadingReleases}
+                    emptyMessage="No releases found for this cluster"
+                    searchPlaceholder="Search releases..."
+                    isLoadingMore={loadingMoreReleases}
+                    allLoaded={allReleasesLoaded}
+                    totalItems={releases.length}
+                />
+            </div>
+
+            {/* Namespaces Section */}
+            <div className="bg-white dark:bg-gray-800 shadow rounded-lg overflow-hidden">
+                <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+                    <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">
+                        Namespaces ({namespaces.length})
+                    </h3>
+                </div>
+                {namespaces.length === 0 ? (
+                    <div className="p-6">
+                        <Alert type="info">
+                            <p className="font-medium mb-2">No namespaces registered yet</p>
+                            <p className="text-sm mb-3">
+                                Namespaces are automatically registered when the agent detects them in your cluster.
+                            </p>
+                            <p className="text-sm font-medium mb-2">To register a namespace:</p>
+                            <ol className="text-sm list-decimal list-inside space-y-1 ml-2">
+                                <li>Add the label <code className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">beecd.io/enabled=true</code> to your namespace</li>
+                                <li>The agent will automatically discover and register it on its next sync</li>
+                            </ol>
+                            <p className="text-sm mt-3 text-gray-600 dark:text-gray-400">
+                                Example: <code className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">kubectl label namespace my-namespace beecd.io/enabled=true</code>
+                            </p>
+                        </Alert>
+                    </div>
+                ) : (
+                    <DataTable
+                        data={namespaces}
+                        columns={namespaceColumns}
+                        keyExtractor={(ns) => ns.namespace_id}
+                        isLoading={loadingNamespaces}
+                        emptyMessage="No namespaces found for this cluster"
+                        searchPlaceholder="Search namespaces..."
+                        isLoadingMore={loadingMoreNamespaces}
+                        allLoaded={allNamespacesLoaded}
+                        totalItems={namespaces.length}
+                        onRowClick={(ns) => setEditingNamespace(ns)}
+                    />
+                )}
+            </div>
+
             {/* Cluster Groups */}
             {groups && groups.length > 0 && (
                 <div className="bg-white dark:bg-gray-800 shadow rounded-lg overflow-hidden">
@@ -1285,58 +1355,6 @@ export function ClusterDetailPage() {
                     isLoadingMore={loadingMoreServices}
                     allLoaded={allServicesLoaded}
                     totalItems={serviceDefinitions.length}
-                />
-            </div>
-
-            {/* Releases Section */}
-            <div className="bg-white dark:bg-gray-800 shadow rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-                    <div className="flex items-center justify-between">
-                        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">
-                            Releases ({releases.length})
-                        </h3>
-                    </div>
-                </div>
-                <DataTable
-                    data={releases}
-                    columns={releaseColumns}
-                    keyExtractor={(r) => r.data.id}
-                    isLoading={loadingReleases}
-                    emptyMessage="No releases found for this cluster"
-                    searchPlaceholder="Search releases..."
-                    isLoadingMore={loadingMoreReleases}
-                    allLoaded={allReleasesLoaded}
-                    totalItems={releases.length}
-                />
-            </div>
-
-            {/* Namespaces Section */}
-            <div className="bg-white dark:bg-gray-800 shadow rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-                    <div className="flex items-center justify-between">
-                        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">
-                            Namespaces ({namespaces.length})
-                        </h3>
-                        <button
-                            onClick={() => setShowAddNamespaceModal(true)}
-                            className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700"
-                        >
-                            <Plus className="w-4 h-4 mr-1" />
-                            Add Namespace
-                        </button>
-                    </div>
-                </div>
-                <DataTable
-                    data={namespaces}
-                    columns={namespaceColumns}
-                    keyExtractor={(ns) => ns.namespace_id}
-                    isLoading={loadingNamespaces}
-                    emptyMessage="No namespaces found for this cluster"
-                    searchPlaceholder="Search namespaces..."
-                    isLoadingMore={loadingMoreNamespaces}
-                    allLoaded={allNamespacesLoaded}
-                    totalItems={namespaces.length}
-                    onRowClick={(ns) => setEditingNamespace(ns)}
                 />
             </div>
 

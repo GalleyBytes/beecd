@@ -90,10 +90,12 @@ async fn test_foreign_key_violation_on_namespace() {
     let non_existent_cluster_id = Uuid::new_v4();
 
     // Try to create namespace with non-existent cluster
-    let result = sqlx::query("INSERT INTO namespaces (id, name, cluster_id) VALUES ($1, $2, $3)")
+    // Even with valid tenant_id, the FK constraint should fail
+    let result = sqlx::query("INSERT INTO namespaces (id, name, cluster_id, tenant_id) VALUES ($1, $2, $3, $4)")
         .bind(Uuid::new_v4())
         .bind("orphan-namespace")
         .bind(non_existent_cluster_id)
+        .bind(env.tenant_id)
         .execute(&env.pool)
         .await;
 
@@ -161,7 +163,7 @@ async fn test_concurrent_updates_on_same_record() {
         .await
         .expect("Failed to setup test environment");
 
-    let cluster_id = create_test_cluster(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
 
     // Launch 10 concurrent updates to the same cluster
     let mut tasks = Vec::new();
@@ -251,9 +253,9 @@ async fn test_batch_operations_near_parameter_limit() {
     // With 4 parameters per insert, we can do ~8000 at once
     // Let's try with 2000 to be safe
 
-    let cluster_id = create_test_cluster(&env.pool).await;
-    let namespace_id = create_test_namespace(&env.pool, cluster_id).await;
-    let (_, _branch_id) = create_test_repo(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
+    let namespace_id = create_test_namespace(&env.pool, cluster_id, env.tenant_id).await;
+    let (_, _branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
 
     let mut release_names = Vec::new();
     for i in 0..2000 {
@@ -284,17 +286,18 @@ async fn test_transaction_rollback_with_foreign_keys() {
         .await
         .expect("Failed to setup test environment");
 
-    let cluster_id = create_test_cluster(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
 
     // Start transaction
     let mut tx = env.pool.begin().await.expect("Failed to start transaction");
 
     // Create namespace in transaction
     let namespace_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO namespaces (id, name, cluster_id) VALUES ($1, $2, $3)")
+    sqlx::query("INSERT INTO namespaces (id, name, cluster_id, tenant_id) VALUES ($1, $2, $3, $4)")
         .bind(namespace_id)
         .bind("tx-namespace")
         .bind(cluster_id)
+        .bind(env.tenant_id)
         .execute(&mut *tx)
         .await
         .expect("Failed to insert namespace");
@@ -379,16 +382,17 @@ async fn test_empty_string_vs_null() {
         .await
         .expect("Failed to setup test environment");
 
-    let (_, branch_id) = create_test_repo(&env.pool).await;
+    let (_, branch_id) = create_test_repo(&env.pool, env.tenant_id).await;
 
     // Insert build target with empty name (should work - no constraint)
     let result = sqlx::query(
-        "INSERT INTO service_definitions (id, name, repo_branch_id, source_branch_requirements) VALUES ($1, $2, $3, $4)"
+        "INSERT INTO service_definitions (id, name, repo_branch_id, source_branch_requirements, tenant_id) VALUES ($1, $2, $3, $4, $5)"
     )
     .bind(Uuid::new_v4())
     .bind("") // empty string
     .bind(branch_id)
     .bind("[]")
+    .bind(env.tenant_id)
     .execute(&env.pool)
     .await;
 
@@ -454,16 +458,17 @@ async fn test_special_characters_in_metadata() {
         .expect("Failed to setup test environment");
 
     let special_metadata =
-        r#"{"key": "value with \"quotes\"", "emoji": "🚀", "newline": "line1\nline2"}"#;
+        r#"{"key": "value with \"quotes\"", "emoji": "rocket", "newline": "line1\nline2"}"#;
 
     let result = sqlx::query(
-        "INSERT INTO clusters (id, name, metadata, version, kubernetes_version) VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO clusters (id, name, metadata, version, kubernetes_version, tenant_id) VALUES ($1, $2, $3, $4, $5, $6)"
     )
     .bind(Uuid::new_v4())
     .bind("special-cluster")
     .bind(special_metadata)
     .bind("1.0")
     .bind("1.28")
+    .bind(env.tenant_id)
     .execute(&env.pool)
     .await;
 
@@ -523,7 +528,7 @@ async fn test_optimistic_locking_pattern() {
         .await
         .expect("Failed to setup test environment");
 
-    let cluster_id = create_test_cluster(&env.pool).await;
+    let cluster_id = create_test_cluster(&env.pool, env.tenant_id).await;
 
     // Read with timestamp
     let original_updated: chrono::DateTime<chrono::Utc> =

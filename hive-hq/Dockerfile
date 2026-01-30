@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Optimized Hive-HQ Dockerfile with BuildKit cache mounts
+# Optimized Hive-HQ Dockerfile - Multi-arch support
+# =============================================================================
+# Supports linux/amd64 and linux/arm64
 # =============================================================================
 
 # Stage 1: Build the React UI with Node.js
@@ -14,34 +16,24 @@ RUN --mount=type=cache,target=/root/.npm,id=npm-cache \
 COPY hive-hq/ui ./
 RUN npm run build
 
-# Stage 2: Build Rust API binary
-FROM rust:1.92.0 AS builder
+# Stage 2: Build Rust API binary using rust-musl-cross
+# Declare TARGETARCH at the top level
+ARG TARGETARCH
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    musl-tools wget ca-certificates linux-libc-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Use different base images based on target architecture
+FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
+FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
-# Setup musl include paths
-RUN mkdir -p /usr/include/x86_64-linux-musl && \
-    ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm && \
-    ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic && \
-    ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+# Select the appropriate builder based on TARGETARCH
+FROM builder-${TARGETARCH} AS builder
 
-# Build OpenSSL (cached as a layer)
-WORKDIR /musl
-RUN wget -q https://github.com/openssl/openssl/archive/OpenSSL_1_1_1f.tar.gz && \
-    tar xzf OpenSSL_1_1_1f.tar.gz && \
-    cd openssl-OpenSSL_1_1_1f && \
-    CC="musl-gcc -fPIE -pie" ./Configure no-shared no-async --prefix=/musl --openssldir=/musl/ssl linux-x86_64 && \
-    make depend && make -j$(nproc) && make install && \
-    rm -rf /musl/OpenSSL_1_1_1f.tar.gz /musl/openssl-OpenSSL_1_1_1f
+# Redeclare ARG after FROM
+ARG TARGETARCH
 
-# Setup Rust targets
 WORKDIR /usr/src
-RUN rustup target add x86_64-unknown-linux-musl
 
 # Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock* ./
 COPY agent/Cargo.toml agent/
 COPY diff/Cargo.toml diff/
 COPY hive/Cargo.toml hive/
@@ -57,13 +49,16 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
     mkdir -p hive-hq/api/src && echo 'fn main() {}' > hive-hq/api/src/main.rs && touch hive-hq/api/src/lib.rs && \
     mkdir -p storage/src && touch storage/src/lib.rs
 
-ENV OPENSSL_DIR=/musl
-
-# Pre-build dependencies with cache mounts
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/usr/src/target,id=beecd-target \
-    cargo build --release --target x86_64-unknown-linux-musl -p api 2>/dev/null || true
+# Pre-build dependencies with architecture-specific cache mounts
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
+    --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
+    --mount=type=cache,target=/usr/src/target,id=beecd-target-${TARGETARCH} \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        RUST_TARGET="aarch64-unknown-linux-musl"; \
+    else \
+        RUST_TARGET="x86_64-unknown-linux-musl"; \
+    fi && \
+    cargo build --release --target $RUST_TARGET -p api 2>/dev/null || true
 
 # Copy real source files
 COPY hive-hq/api/src ./hive-hq/api/src
@@ -74,11 +69,20 @@ COPY hive/proto ./hive/proto
 ARG BUILD_VERSION
 ENV BUILD_VERSION=${BUILD_VERSION}
 
-RUN cargo build --release --target x86_64-unknown-linux-musl -p api && \
-    cp /usr/src/target/x86_64-unknown-linux-musl/release/api /usr/local/bin/hivehq
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        RUST_TARGET="aarch64-unknown-linux-musl"; \
+    else \
+        RUST_TARGET="x86_64-unknown-linux-musl"; \
+    fi && \
+    cargo build --release --target $RUST_TARGET -p api && \
+    cp /usr/src/target/$RUST_TARGET/release/api /usr/local/bin/hivehq
 
 # Runtime image
 FROM scratch
+
+ARG IMAGE_SOURCE=https://github.com/galleybytes/beecd
+LABEL org.opencontainers.image.source=${IMAGE_SOURCE}
+
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=builder /usr/local/bin/hivehq /usr/local/bin/hivehq
 COPY --from=ui-builder /ui/dist dist

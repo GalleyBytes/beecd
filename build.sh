@@ -2,7 +2,7 @@
 # =============================================================================
 # Docker Build Script for beecd services
 # =============================================================================
-# Uses Docker BuildKit with cross-compilation for linux/amd64 images
+# Uses Docker BuildKit with cross-compilation for linux/amd64 and linux/arm64
 #
 # Usage:
 #   ./build.sh agent                    # Build agent only
@@ -172,30 +172,27 @@ build_service() {
 
     local start_time=$(date +%s)
 
+    # For multi-arch, we can't use --load, so we either push or export
+    local build_opts=()
+    if [[ "$PUSH_IMAGE" == true ]]; then
+        build_opts+=("--push")
+    else
+        log_warn "Multi-arch build without --push will not load images locally"
+        log_warn "Images will only be cached. Use --push to push to registry."
+    fi
+
     # Build once with all tags
     docker buildx build \
-        --platform linux/amd64 \
+        --platform linux/amd64,linux/arm64 \
         --build-arg BUILD_VERSION="$BUILD_VERSION" \
         --file "${service}/Dockerfile" \
         "${tag_args[@]}" \
-        . \
-        --load
+        "${build_opts[@]}" \
+        .
 
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
     log_success "Build completed in ${duration}s"
-
-    # Push to all registries if requested
-    if [[ "$PUSH_IMAGE" == true ]]; then
-        for registry in "${REGISTRIES[@]}"; do
-            local full_image="${registry}/${image_name}:${tag}"
-            local latest_image="${registry}/${image_name}:latest"
-            log_info "Pushing to ${registry}..."
-            docker push "$full_image"
-            docker push "$latest_image"
-            log_success "Pushed to ${registry}"
-        done
-    fi
 }
 
 #######################################

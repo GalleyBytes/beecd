@@ -10,3 +10,5 @@ export { ClusterGroupsPage } from './ClusterGroupsPage';
 export { ClusterGroupDetailPage } from './ClusterGroupDetailPage';
 export { ReleaseDetailPage } from './ReleaseDetailPage';
 export { LoginPage } from './LoginPage';
+export { RegisterPage } from './RegisterPage';
+export { SettingsPage } from './SettingsPage';
