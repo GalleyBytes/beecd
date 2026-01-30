@@ -3,6 +3,8 @@
 Hive mind for your deploys. Because YOLO deploys aren't cute in production.  \
 Before anything goes live, you see a diff of what's changing.
 
+<!-- Multi-arch Docker builds fixed -->
+
 ## Getting Started
 
 Go to [https://beecd.galleybytes.com](https://beecd.galleybytes.com) and create an account. After that, log in at your tenant URL (e.g., `https://acme.beecd.galleybytes.com`).
