@@ -68,6 +68,11 @@ jobs:
               echo "Skipping merge commit: $msg"
               continue
             fi
+            # Skip specific legacy commit from history
+            if [[ "$msg" == "Initial plan" ]]; then
+              echo "Skipping legacy commit: $msg"
+              continue
+            fi
             if [[ ! "$msg" =~ $PATTERN ]]; then
               echo "Invalid commit message: $msg"
               echo "Expected format: type(scope)?: description"
