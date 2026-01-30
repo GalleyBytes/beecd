@@ -5,17 +5,15 @@
 # Supports linux/amd64 and linux/arm64 using rust-musl-cross base images
 # =============================================================================
 
-# Declare TARGETARCH at the top level
-ARG TARGETARCH
-
 # Use different base images based on target architecture
 FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
 FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
-# Select the appropriate builder based on TARGETARCH
-FROM builder-${TARGETARCH} AS builder
+# Select the appropriate builder based on TARGETARCH (automatically set by BuildKit)
+# TARGETARCH is a built-in arg that gets set to amd64 or arm64
+FROM builder-${TARGETARCH:-amd64} AS builder
 
-# Redeclare ARG after FROM
+# Declare ARG to make it available in RUN commands
 ARG TARGETARCH
 
 # Install protobuf compiler and update CA certificates
