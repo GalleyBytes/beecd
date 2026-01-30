@@ -16,22 +16,14 @@ FROM builder-${TARGETARCH:-amd64} AS builder
 # Declare ARG to make it available in RUN commands
 ARG TARGETARCH
 
-# Install dependencies for building: protobuf, OpenSSL build deps, and CA certificates
+# Install dependencies for building: protobuf and CA certificates
 RUN apt-get update && \
     apt-get install -y \
         protobuf-compiler \
         ca-certificates \
-        pkg-config \
-        libssl-dev \
-        perl \
-        make \
         && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
-
-# Configure OpenSSL for musl static linking with vendored source compilation
-ENV OPENSSL_STATIC=yes \
-    OPENSSL_VENDORED=yes
 
 WORKDIR /usr/src
 

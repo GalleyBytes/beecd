@@ -28,19 +28,13 @@ FROM builder-${TARGETARCH:-amd64} AS builder
 # Declare ARG to make it available in RUN commands
 ARG TARGETARCH
 
-# Install dependencies for building OpenSSL from source
+# Install dependencies for building
 RUN apt-get update && \
     apt-get install -y \
-        pkg-config \
-        libssl-dev \
-        perl \
-        make \
+        protobuf-compiler \
+        ca-certificates \
         && \
     rm -rf /var/lib/apt/lists/*
-
-# Configure OpenSSL for musl static linking with vendored source compilation
-ENV OPENSSL_STATIC=yes \
-    OPENSSL_VENDORED=yes
 
 WORKDIR /usr/src
 
