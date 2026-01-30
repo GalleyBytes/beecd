@@ -16,9 +16,9 @@ FROM builder-${TARGETARCH:-amd64} AS builder
 # Declare ARG to make it available in RUN commands
 ARG TARGETARCH
 
-# Install protobuf compiler and update CA certificates
+# Install protobuf compiler, pkg-config, OpenSSL, and update CA certificates
 RUN apt-get update && \
-    apt-get install -y protobuf-compiler ca-certificates && \
+    apt-get install -y protobuf-compiler ca-certificates pkg-config libssl-dev && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 

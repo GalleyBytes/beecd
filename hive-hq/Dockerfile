@@ -28,6 +28,11 @@ FROM builder-${TARGETARCH:-amd64} AS builder
 # Declare ARG to make it available in RUN commands
 ARG TARGETARCH
 
+# Install pkg-config and OpenSSL development libraries
+RUN apt-get update && \
+    apt-get install -y pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /usr/src
 
 # Copy manifests first for dependency caching
