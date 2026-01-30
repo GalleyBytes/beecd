@@ -234,7 +234,7 @@ async fn read_content(
     tenant_domain: &str,
 ) -> Result<(), HiveError> {
     let url = format!("{}{}", base_url, url_query_params);
-    debug!("Fetching content from URL: {}", url);
+    debug!("[tenant:{}] Fetching content from URL: {}", tenant_domain, url);
     let json_response = fetch_data(&url, github_token).await;
     let raw_data = match json_response {
         Ok(data) => {
@@ -811,6 +811,7 @@ impl GrpcServer {
     }
 
     /// Fetch and decrypt GitHub token from tenant_secrets
+    /// Falls back to GITHUB_TOKEN environment variable if not found in database
     /// Returns None if no token is found
     async fn get_github_token(
         &self,
@@ -832,8 +833,17 @@ impl GrpcServer {
         .map_err(|e| Status::internal(format!("Failed to fetch GitHub token: {}", e)))?;
 
         let Some((ciphertext, iv)) = row else {
+            // Fall back to environment variables
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                debug!(
+                    "[tenant:{}] Using GitHub token from GITHUB_TOKEN environment variable (fallback)",
+                    tenant_domain
+                );
+                return Ok(Some(token));
+            }
+
             return Err(Status::failed_precondition(
-                "No GitHub token found in tenant_secrets - please configure github_token secret",
+                format!("No GitHub token configured for tenant '{}'", tenant_domain)
             ));
         };
 
