@@ -17,18 +17,24 @@ COPY hive-hq/ui ./
 RUN npm run build
 
 # Stage 2: Build Rust API binary using rust-musl-cross
-# Declare TARGETARCH at the top level
-ARG TARGETARCH
-
 # Use different base images based on target architecture
 FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
 FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
-# Select the appropriate builder based on TARGETARCH
-FROM builder-${TARGETARCH} AS builder
+# Select the appropriate builder based on TARGETARCH (automatically set by BuildKit)
+# TARGETARCH is a built-in arg that gets set to amd64 or arm64
+FROM builder-${TARGETARCH:-amd64} AS builder
 
-# Redeclare ARG after FROM
+# Declare ARG to make it available in RUN commands
 ARG TARGETARCH
+
+# Install dependencies for building
+RUN apt-get update && \
+    apt-get install -y \
+        protobuf-compiler \
+        ca-certificates \
+        && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src
 

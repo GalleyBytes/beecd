@@ -5,22 +5,23 @@
 # Supports linux/amd64 and linux/arm64 using rust-musl-cross base images
 # =============================================================================
 
-# Declare TARGETARCH at the top level
-ARG TARGETARCH
-
 # Use different base images based on target architecture
 FROM messense/rust-musl-cross:x86_64-musl AS builder-amd64
 FROM messense/rust-musl-cross:aarch64-musl AS builder-arm64
 
-# Select the appropriate builder based on TARGETARCH
-FROM builder-${TARGETARCH} AS builder
+# Select the appropriate builder based on TARGETARCH (automatically set by BuildKit)
+# TARGETARCH is a built-in arg that gets set to amd64 or arm64
+FROM builder-${TARGETARCH:-amd64} AS builder
 
-# Redeclare ARG after FROM
+# Declare ARG to make it available in RUN commands
 ARG TARGETARCH
 
-# Install protobuf compiler and update CA certificates
+# Install dependencies for building: protobuf and CA certificates
 RUN apt-get update && \
-    apt-get install -y protobuf-compiler ca-certificates && \
+    apt-get install -y \
+        protobuf-compiler \
+        ca-certificates \
+        && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
@@ -42,10 +43,6 @@ RUN mkdir -p agent/src && echo 'fn main() {}' > agent/src/main.rs && touch agent
     mkdir -p hive-hq/types/src && touch hive-hq/types/src/lib.rs && \
     mkdir -p diff/src && touch diff/src/lib.rs && \
     mkdir -p storage/src && touch storage/src/lib.rs
-
-# Set Rust target as environment variable based on architecture
-ENV RUST_TARGET=${TARGETARCH:+$(test "$TARGETARCH" = "arm64" && echo "aarch64-unknown-linux-musl" || echo "x86_64-unknown-linux-musl")}
-RUN echo "Building for architecture: $TARGETARCH, target: $RUST_TARGET"
 
 # Build dependencies with architecture-specific cache mounts
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
