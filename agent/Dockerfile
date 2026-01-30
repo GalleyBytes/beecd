@@ -14,10 +14,9 @@ ARG ALPINE_VERSION=3.19.1
 # =============================================================================
 # Stage 1: Build OpenSSL for musl (cached layer)
 # =============================================================================
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION} AS openssl-builder
+FROM rust:${RUST_VERSION} AS openssl-builder
 
 ARG TARGETPLATFORM
-ARG BUILDPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -52,10 +51,9 @@ RUN wget -q https://github.com/openssl/openssl/archive/OpenSSL_1_1_1f.tar.gz && 
 # =============================================================================
 # Stage 2: Build dependencies (cached layer)
 # =============================================================================
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION} AS deps-builder
+FROM rust:${RUST_VERSION} AS deps-builder
 
 ARG TARGETPLATFORM
-ARG BUILDPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
 

@@ -2,10 +2,9 @@
 # =============================================================================
 # Optimized Hive Dockerfile with BuildKit cache mounts
 # =============================================================================
-FROM --platform=$BUILDPLATFORM rust:1.92.0 AS builder
+FROM rust:1.92.0 AS builder
 
 ARG TARGETPLATFORM
-ARG BUILDPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -93,7 +92,7 @@ RUN export RUST_TARGET=$(cat /rust-target) && \
   cp /usr/src/target/$RUST_TARGET/release/hive /usr/local/bin/hive
 
 # Fetch sops binary
-FROM --platform=$TARGETPLATFORM alpine:3.19.1 AS sops
+FROM alpine:3.19.1 AS sops
 
 ARG TARGETARCH
 
@@ -108,7 +107,7 @@ RUN apk add --no-cache curl && \
   chmod +x /usr/local/bin/sops
 
 # Runtime image
-FROM --platform=$TARGETPLATFORM alpine:3.19.1
+FROM alpine:3.19.1
 RUN apk add --no-cache gpg gpg-agent ca-certificates
 COPY --from=builder /usr/local/bin/hive /usr/local/bin/hive
 COPY --from=sops /usr/local/bin/sops /usr/local/bin/sops

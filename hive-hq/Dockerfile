@@ -4,7 +4,7 @@
 # =============================================================================
 
 # Stage 1: Build the React UI with Node.js
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS ui-builder
+FROM node:22-bookworm-slim AS ui-builder
 
 WORKDIR /ui
 COPY hive-hq/ui/package.json hive-hq/ui/package-lock.json ./
@@ -15,10 +15,9 @@ COPY hive-hq/ui ./
 RUN npm run build
 
 # Stage 2: Build Rust API binary
-FROM --platform=$BUILDPLATFORM rust:1.92.0 AS builder
+FROM rust:1.92.0 AS builder
 
 ARG TARGETPLATFORM
-ARG BUILDPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -101,7 +100,7 @@ RUN export RUST_TARGET=$(cat /rust-target) && \
     cp /usr/src/target/$RUST_TARGET/release/api /usr/local/bin/hivehq
 
 # Runtime image
-FROM --platform=$TARGETPLATFORM scratch
+FROM scratch
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=builder /usr/local/bin/hivehq /usr/local/bin/hivehq
 COPY --from=ui-builder /ui/dist dist
