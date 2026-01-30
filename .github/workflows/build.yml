@@ -20,6 +20,9 @@ env:
 jobs:
   build-multi-arch:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         service: [agent, hive, hive-hq]
