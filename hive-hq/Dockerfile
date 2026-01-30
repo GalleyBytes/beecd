@@ -33,6 +33,10 @@ RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# Set environment variables for OpenSSL vendoring (for musl static builds)
+ENV OPENSSL_STATIC=1 \
+    OPENSSL_VENDORED=1
+
 WORKDIR /usr/src
 
 # Copy manifests first for dependency caching

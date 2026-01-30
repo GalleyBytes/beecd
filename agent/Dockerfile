@@ -22,6 +22,10 @@ RUN apt-get update && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# Set environment variables for OpenSSL vendoring (for musl static builds)
+ENV OPENSSL_STATIC=1 \
+    OPENSSL_VENDORED=1
+
 WORKDIR /usr/src
 
 # Copy only Cargo manifests first for dependency caching
