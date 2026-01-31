@@ -7,6 +7,16 @@ import type { RepoBranch, ServiceDefinitionData, RepoWebhookEvent } from '@/type
 
 const GITHUB_URL = 'https://github.com';
 
+// Validate that manifest path template contains all required placeholders
+function isValidManifestPathTemplate(template: string): boolean {
+    if (!template.trim()) return true; // Empty is valid (optional field)
+    return (
+        template.includes('{cluster}') &&
+        template.includes('{namespace}') &&
+        template.includes('{service}')
+    );
+}
+
 export function RepoDetailPage() {
     const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
@@ -643,9 +653,12 @@ export function RepoDetailPage() {
                                         id="manifestPath"
                                         value={newServiceManifestPath}
                                         onChange={(e) => setNewServiceManifestPath(e.target.value)}
-                                        onKeyDown={(e) => e.key === 'Enter' && handleAddService()}
-                                        placeholder={newServiceName ? `{cluster}/manifests/{namespace}/${newServiceName}/${newServiceName}.yaml` : '{cluster}/manifests/{namespace}/{service}/{service}.yaml'}
-                                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-green-500 focus:border-green-500 dark:bg-gray-700 dark:text-white font-mono text-sm"
+                                        onKeyDown={(e) => e.key === 'Enter' && isValidManifestPathTemplate(newServiceManifestPath) && handleAddService()}
+                                        placeholder={'{cluster}/manifests/{namespace}/{service}/{service}.yaml'}
+                                        className={`w-full px-3 py-2 border rounded-md shadow-sm focus:ring-green-500 focus:border-green-500 dark:bg-gray-700 dark:text-white font-mono text-sm ${newServiceManifestPath.trim() && !isValidManifestPathTemplate(newServiceManifestPath)
+                                                ? 'border-red-300 dark:border-red-600'
+                                                : 'border-gray-300 dark:border-gray-600'
+                                            }`}
                                     />
                                     <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                                         Path in git to pull manifests from. Use <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">{'{cluster}'}</code>, <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">{'{namespace}'}</code>, <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">{'{service}'}</code> as placeholders.
@@ -654,6 +667,11 @@ export function RepoDetailPage() {
                                         • Ends with <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">.yaml</code> → watches a single file<br />
                                         • Directory path → watches all <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">*.yaml</code> files
                                     </p>
+                                    {newServiceManifestPath.trim() && !isValidManifestPathTemplate(newServiceManifestPath) && (
+                                        <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                                            ⚠ Path must include all three placeholders: <code className="bg-red-100 dark:bg-red-900/30 px-1 rounded">{'{cluster}'}</code>, <code className="bg-red-100 dark:bg-red-900/30 px-1 rounded">{'{namespace}'}</code>, and <code className="bg-red-100 dark:bg-red-900/30 px-1 rounded">{'{service}'}</code>
+                                        </p>
+                                    )}
                                 </div>
                             </div>
                             {addServiceMutation.isError && (
@@ -672,7 +690,7 @@ export function RepoDetailPage() {
                                 </button>
                                 <button
                                     onClick={handleAddService}
-                                    disabled={!newServiceName.trim() || addServiceMutation.isPending}
+                                    disabled={!newServiceName.trim() || addServiceMutation.isPending || !isValidManifestPathTemplate(newServiceManifestPath)}
                                     className="px-4 py-2 text-sm font-medium text-white bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-md transition-colors"
                                 >
                                     {addServiceMutation.isPending ? 'Adding...' : 'Add Service'}

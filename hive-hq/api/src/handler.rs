@@ -6663,7 +6663,7 @@ pub async fn post_branch(
                 END,
                 CASE
                     WHEN es.manifest_template_distinct_count = 1 AND es.manifest_template_single IS NOT NULL THEN es.manifest_template_single
-                    ELSE '{cluster}/manifests/{namespace}/' || es.name || '/' || es.name || '.yaml'
+                    ELSE '{cluster}/manifests/{namespace}/{service}/{service}.yaml'
                 END,
                 $3
             FROM
@@ -7003,8 +7003,7 @@ pub async fn post_branch_service(
     .bind(id)
     .bind(&data.name)
     .bind(format!(
-        "{{cluster}}/manifests/{{namespace}}/{}/{}.yaml",
-        &data.name, &data.name
+        "{{cluster}}/manifests/{{namespace}}/{{service}}/{{service}}.yaml"
     ))
     .bind(tenant_id)
     .execute(&mut *tx)
@@ -7156,11 +7155,19 @@ pub async fn post_global_repo_service(
     } else {
         // Use provided template or generate default
         let template = data.manifest_path_template.unwrap_or_else(|| {
-            format!(
-                "{{cluster}}/manifests/{{namespace}}/{}/{}.yaml",
-                &data.name, &data.name
-            )
+            format!("{{cluster}}/manifests/{{namespace}}/{{service}}/{{service}}.yaml")
         });
+
+        let validation = validate_path_template(&template);
+
+        if !validation.valid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                validation
+                    .error
+                    .unwrap_or_else(|| "Invalid path template".to_string()),
+            ));
+        }
 
         // TODO Instead of re-enabling a deleted service from a branch,
         // ask the user if they want to re-enable the service for the deleted
@@ -9131,6 +9138,14 @@ pub async fn register_repo_webhook(
 
     set_tenant_context(&mut tx, tenant_id).await?;
 
+    let mut read_tx = state
+        .readonly_pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "readonly_db"))?;
+
+    set_tenant_context(&mut read_tx, tenant_id).await?;
+
     // Get the repo info
     let repo = sqlx::query_as::<_, RepoData>(
         r#"
@@ -9147,7 +9162,7 @@ pub async fn register_repo_webhook(
         "#,
     )
     .bind(repo_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *read_tx)
     .await
     .map_err(|e| sanitize_db_error(e, "register_repo_webhook"))?
     .ok_or((StatusCode::NOT_FOUND, "Repo not found".to_string()))?;
@@ -9165,7 +9180,7 @@ pub async fn register_repo_webhook(
         r#"SELECT id, deleted_at FROM repo_webhooks WHERE repo_id = $1"#,
     )
     .bind(repo_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *read_tx)
     .await
     .map_err(|e| sanitize_db_error(e, "register_repo_webhook"))?;
 
@@ -9191,7 +9206,10 @@ pub async fn register_repo_webhook(
 
     // Make webhook routing unambiguous across hosts/org/repo by embedding repo_id.
     // Query params do not affect the Axum route match.
-    let callback_url = format!("{}?repo_id={}", base_callback_url, repo_id);
+    let callback_url = format!(
+        "{}?repo_id={}&tenant_id={}",
+        base_callback_url, repo_id, tenant_id
+    );
 
     // Create webhook on GitHub
     let api_base_url = repo.api_base_url.trim_end_matches('/');
@@ -9496,6 +9514,29 @@ pub async fn receive_github_webhook(
     let repo_name = &payload.repository.name;
 
     let repo_id = params.get("repo_id").and_then(|v| Uuid::parse_str(v).ok());
+    let tenant_id = params
+        .get("tenant_id")
+        .and_then(|v| Uuid::parse_str(v).ok());
+    let tenant_id = tenant_id.ok_or((
+        StatusCode::BAD_REQUEST,
+        "Missing or invalid tenant_id query parameter".to_string(),
+    ))?;
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "register_repo_webhook_begin"))?;
+
+    set_tenant_context(&mut tx, tenant_id).await?;
+
+    let mut read_tx = state
+        .readonly_pool
+        .begin()
+        .await
+        .map_err(|e| sanitize_db_error(e, "readonly_db"))?;
+
+    set_tenant_context(&mut read_tx, tenant_id).await?;
 
     // Find the webhook and its secret.
     // Prefer repo_id from callback URL query param; fall back to org/repo lookup.
@@ -9509,7 +9550,7 @@ pub async fn receive_github_webhook(
             "#,
         )
         .bind(repo_id)
-        .fetch_optional(&state.readonly_pool)
+        .fetch_optional(&mut *read_tx)
         .await
         .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?
     } else {
@@ -9524,7 +9565,7 @@ pub async fn receive_github_webhook(
         )
         .bind(org)
         .bind(repo_name)
-        .fetch_optional(&state.readonly_pool)
+        .fetch_optional(&mut *read_tx)
         .await
         .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?
     }
@@ -9568,14 +9609,6 @@ pub async fn receive_github_webhook(
         ));
     }
 
-    // Start transaction and set tenant context for all subsequent queries
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|e| sanitize_db_error(e, "receive_github_webhook_begin"))?;
-    set_tenant_context(&mut tx, tenant_id).await?;
-
     // Create webhook event record
     let event_id = sqlx::query_scalar::<_, Uuid>(
         r#"
@@ -9615,7 +9648,7 @@ pub async fn receive_github_webhook(
     .bind(org)
     .bind(repo_name)
     .bind(&branch)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *read_tx)
     .await
     .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -9686,7 +9719,7 @@ pub async fn receive_github_webhook(
                             )
                             .bind(namespace)
                             .bind(cluster)
-                            .fetch_optional(&mut *tx)
+                            .fetch_optional(&mut *read_tx)
                             .await
                             .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
@@ -9809,7 +9842,7 @@ pub async fn receive_github_webhook(
         .bind(service_def_id)
         .bind(ns_id)
         .bind(&payload.after)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *read_tx)
         .await
         .map_err(|e| sanitize_db_error(e, "receive_github_webhook"))?;
 
