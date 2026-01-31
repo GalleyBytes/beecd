@@ -6663,7 +6663,7 @@ pub async fn post_branch(
                 END,
                 CASE
                     WHEN es.manifest_template_distinct_count = 1 AND es.manifest_template_single IS NOT NULL THEN es.manifest_template_single
-                    ELSE '{cluster}/manifests/{namespace}/' || es.name || '/' || es.name || '.yaml'
+                    ELSE '{cluster}/manifests/{namespace}/{service}/{service}.yaml'
                 END,
                 $3
             FROM
@@ -7003,8 +7003,7 @@ pub async fn post_branch_service(
     .bind(id)
     .bind(&data.name)
     .bind(format!(
-        "{{cluster}}/manifests/{{namespace}}/{}/{}.yaml",
-        &data.name, &data.name
+        "{{cluster}}/manifests/{{namespace}}/{{service}}/{{service}}.yaml"
     ))
     .bind(tenant_id)
     .execute(&mut *tx)
@@ -7156,11 +7155,19 @@ pub async fn post_global_repo_service(
     } else {
         // Use provided template or generate default
         let template = data.manifest_path_template.unwrap_or_else(|| {
-            format!(
-                "{{cluster}}/manifests/{{namespace}}/{}/{}.yaml",
-                &data.name, &data.name
-            )
+            format!("{{cluster}}/manifests/{{namespace}}/{{service}}/{{service}}.yaml")
         });
+
+        let validation = validate_path_template(&template);
+
+        if !validation.valid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                validation
+                    .error
+                    .unwrap_or_else(|| "Invalid path template".to_string()),
+            ));
+        }
 
         // TODO Instead of re-enabling a deleted service from a branch,
         // ask the user if they want to re-enable the service for the deleted
